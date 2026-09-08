@@ -1,0 +1,11 @@
+customtkinter>=5.2.0
+edge-tts>=6.1.0
+pygame>=2.5.0
+pyinstaller>=6.0.0
+pypdf>=4.0.0
+python-docx>=1.1.0
+ebooklib>=0.18
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+striprtf>=0.0.26
+pywin32>=306
