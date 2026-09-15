@@ -1,21 +1,57 @@
 # 发布说明
 
-## 发给别人用哪个文件？
+## 发给别人
 
-把文件夹 `发布` 里的：
+把 `发布\` 里对应版本的安装包发出去即可，例如：
 
-**`听小说安装包_v1.0.0.exe`**
+**`听小说安装包_v1.2.0.exe`**
 
-发给对方即可。对方双击运行 → 选安装目录 → 完成，即可从开始菜单/桌面启动。
+对方双击 → 选目录 → 完成安装。
 
-## 自己重新打包安装包
+## 自己重新打包
 
-1. 先确保 `听小说应用\听小说.exe` 是最新版（可用 `novel_listener\build_exe.bat` 重新生成）
-2. 双击项目根目录的 `build_installer.bat`
-3. 生成结果在 `发布\` 目录
+### 1. 先打主程序（有更新时）
 
-## 说明
+```bat
+novel_listener\build_exe.bat
+```
 
-- 安装程序使用 Inno Setup，默认装到「程序文件」或用户自选目录
+把生成的 `dist\听小说.exe` 放到 `听小说应用\听小说.exe`。
+
+### 2. 再打安装包（自定义版本）
+
+在项目**根目录**（若在 PowerShell 中，必须加 `.\`）：
+
+```powershell
+.\build_installer.bat 1.2.0
+```
+
+或双击 `build_installer.bat`，按提示输入版本号。
+
+### 3. 输出
+
+```text
+发布\听小说安装包_v1.2.0.exe
+```
+
+## 版本号
+
+- 格式：`1.0.0` 或 `1.2.3.4`
+- 成功后写入根目录 `VERSION`，下次默认用它
+- 也可先改 `VERSION` 文件，再直接运行 `build_installer.bat` 回车确认
+
+## 常见问题
+
+| 现象 | 处理 |
+|------|------|
+| 找不到听小说.exe | 先运行 `novel_listener\build_exe.bat` |
+| 找不到 ISCC.exe | `winget install JRSoftware.InnoSetup` |
+| 版本一直是 1.0.0 | 用 `.\build_installer.bat 1.2.0` 显式指定 |
+| PowerShell 提示无法识别 bat | 写成 `.\build_installer.bat 1.2.0`（不要漏掉 `.\`） |
+| 双击 bat 一闪而过 | 看报错；失败时脚本会 `pause` |
+| PowerShell 报 Unexpected token / 中文乱码 | 拉取最新后再运行 `.\build_installer.bat 1.2.0` |
+
+## 其他
+
 - 可选创建桌面快捷方式
-- 卸载不会删除听书进度（`%USERPROFILE%\.novel_listener`）
+- 卸载不会删除 `%USERPROFILE%\.novel_listener` 里的听书进度
