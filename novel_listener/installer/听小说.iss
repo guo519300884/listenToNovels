@@ -1,8 +1,14 @@
 ; 听小说 — Inno Setup 安装脚本
-; 双击上级目录 build_installer.bat 即可生成安装包
+; 推荐：项目根目录 build_installer.bat [版本号]
+; 也可：ISCC.exe /DMyAppVersion=1.2.3 /DMyAppVersionInfo=1.2.3.0 听小说.iss
 
 #define MyAppName "听小说"
-#define MyAppVersion "1.0.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.0"
+#endif
+#ifndef MyAppVersionInfo
+  #define MyAppVersionInfo "1.0.0.0"
+#endif
 #define MyAppPublisher "听小说"
 #define MyAppExeName "听小说.exe"
 
@@ -26,7 +32,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
-VersionInfoVersion={#MyAppVersion}.0
+VersionInfoVersion={#MyAppVersionInfo}
 VersionInfoProductName={#MyAppName}
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} 安装程序
