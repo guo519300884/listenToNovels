@@ -1,8 +1,11 @@
 ; 听小说 — Inno Setup 安装脚本
-; 推荐：项目根目录 build_installer.bat [版本号]
-; 也可：ISCC.exe /DMyAppVersion=1.2.3 /DMyAppVersionInfo=1.2.3.0 听小说.iss
+; 请用项目根目录 build_installer.bat / build_installer.ps1 打包（可自定义版本号）
 
 #define MyAppName "听小说"
+; version_defines.iss 由打包脚本自动生成；若不存在则使用下面的默认值
+#ifexist "version_defines.iss"
+  #include "version_defines.iss"
+#endif
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
 #endif
@@ -50,6 +53,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 Source: "..\..\听小说应用\听小说.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\听小说应用\使用说明.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\听小说应用\示例小说.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\..\听小说应用\测试小说.docx"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\听小说应用\示例小说.docx"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
