@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-echo 正在打包听小说.exe（多格式 + 真人语音）...
+echo 正在打包听小说.exe（多格式 + 压缩包 + 真人语音）...
 python -m PyInstaller --noconfirm --clean --windowed --onefile ^
   --name "听小说" ^
   --hidden-import=edge_tts ^
@@ -12,9 +12,11 @@ python -m PyInstaller --noconfirm --clean --windowed --onefile ^
   --hidden-import=bs4 ^
   --hidden-import=lxml ^
   --hidden-import=striprtf ^
+  --hidden-import=py7zr ^
   --collect-all customtkinter ^
   --collect-all edge_tts ^
   --collect-all ebooklib ^
+  --collect-all py7zr ^
   app.py
 if errorlevel 1 (
   echo 打包失败

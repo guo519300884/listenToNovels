@@ -5,15 +5,20 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import gzip
 import hashlib
 import json
 import queue
 import re
+import shutil
+import tarfile
 import threading
 import time
+import zipfile
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, messagebox
+import tkinter as tk
 
 import customtkinter as ctk
 import edge_tts
@@ -27,7 +32,12 @@ LIBRARY_FILE = APP_DIR / "library.json"
 CACHE_DIR = APP_DIR / "tts_cache"
 
 NOVEL_FILETYPES = [
-    ("支持的小说文件", "*.txt *.pdf *.doc *.docx *.epub *.rtf *.html *.htm *.md *.markdown *.text"),
+    (
+        "支持的小说 / 压缩包",
+        "*.txt *.pdf *.doc *.docx *.epub *.rtf *.html *.htm *.md *.markdown *.text "
+        "*.zip *.7z *.rar *.tar *.tgz *.gz",
+    ),
+    ("压缩包", "*.zip *.7z *.rar *.tar *.tgz *.gz *.tar.gz *.tar.bz2 *.tar.xz"),
     ("文本文件", "*.txt *.text *.md *.markdown"),
     ("PDF 文件", "*.pdf"),
     ("Word 文档", "*.doc *.docx"),
@@ -48,6 +58,17 @@ NOVEL_SUFFIXES = {
     ".html",
     ".htm",
 }
+ARCHIVE_SUFFIXES = {".zip", ".7z", ".rar", ".tar", ".tgz", ".tbz2", ".txz", ".gz"}
+ARCHIVE_MULTI_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz")
+
+# 导入体积上限（压缩包可较大；解压后仍做安全限制）
+MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024  # 压缩包 1GB
+MAX_EXTRACT_TOTAL_BYTES = 4 * 1024 * 1024 * 1024  # 解压合计约 4GB
+MAX_SINGLE_MEMBER_BYTES = 800 * 1024 * 1024  # 单个解压文件约 800MB
+MAX_ARCHIVE_NOVELS = 800  # 单个压缩包最多导入本数
+MAX_FOLDER_SCAN = 3000  # 文件夹扫描上限
+MAX_NOVEL_OPEN_WARN_BYTES = 200 * 1024 * 1024  # 打开单本超过 200MB 再提示
+IMPORT_EXTRACT_DIR = APP_DIR / "imports"
 
 # 日间 / 夜间 两套主题（保证文字与背景对比清晰）
 THEMES: dict[str, dict[str, str]] = {
@@ -164,8 +185,20 @@ CHAPTER_PATTERNS = [
     re.compile(r"^\s*[【\[]?\s*第?\s*\d+\s*[章节回卷]\s*[】\]]?.*$"),
     re.compile(r"^\s*[【\[]?(序章|楔子|引子|前言|序言|序|尾声|终章|番外|后记|附录).*$"),
 ]
+# 合并为单次匹配，大文件分章更快
+CHAPTER_HEADING_RE = re.compile(
+    r"^(?:"
+    r"第[零一二三四五六七八九十百千万两〇\d]+[章节回卷部集].*"
+    r"|Chapter\s+\d+.*"
+    r"|CHAPTER\s+[IVXLCDM]+.*"
+    r"|[【\[]?\s*第?\s*\d+\s*[章节回卷]\s*[】\]]?.*"
+    r"|[【\[]?(?:序章|楔子|引子|前言|序言|序|尾声|终章|番外|后记|附录).*"
+    r")$",
+    re.IGNORECASE,
+)
 
 SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?；;…])\s*")
+CHAPTER_UI_BATCH = 60  # 目录分批渲染，避免一次创建上千控件卡死界面
 
 
 def clean_chapter_title(title: str) -> str:
@@ -183,6 +216,7 @@ def format_count(n: int) -> str:
 def ensure_app_dir() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    IMPORT_EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_json(path: Path, default):
@@ -213,6 +247,234 @@ def novel_display_title(path: Path) -> str:
 
 def is_novel_file(path: Path) -> bool:
     return path.suffix.lower() in NOVEL_SUFFIXES and (not path.exists() or path.is_file())
+
+
+def archive_kind(path: Path) -> str | None:
+    """返回压缩类型标识；非压缩包返回 None。"""
+    name = path.name.lower()
+    for multi in ARCHIVE_MULTI_SUFFIXES:
+        if name.endswith(multi):
+            return multi
+    suf = path.suffix.lower()
+    if suf in ARCHIVE_SUFFIXES:
+        return suf
+    return None
+
+
+def is_archive_file(path: Path) -> bool:
+    return archive_kind(path) is not None and (not path.exists() or path.is_file())
+
+
+def _safe_join(dest: Path, member_name: str) -> Path | None:
+    """防止 zip-slip：成员路径必须落在 dest 内。"""
+    # zip/7z 可能用反斜杠
+    member_name = member_name.replace("\\", "/").lstrip("/")
+    if not member_name or member_name.endswith("/"):
+        return None
+    target = (dest / member_name).resolve()
+    try:
+        target.relative_to(dest.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+def _write_limited(dest_file: Path, data: bytes, *, budget: list[int]) -> None:
+    if len(data) > MAX_SINGLE_MEMBER_BYTES:
+        raise ValueError(f"压缩包内单文件过大（>{MAX_SINGLE_MEMBER_BYTES // 1024 // 1024}MB）：{dest_file.name}")
+    if budget[0] + len(data) > MAX_EXTRACT_TOTAL_BYTES:
+        raise ValueError(f"解压体积超过上限（{MAX_EXTRACT_TOTAL_BYTES // 1024 // 1024 // 1024}GB）")
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+    dest_file.write_bytes(data)
+    budget[0] += len(data)
+
+
+def _copy_limited(src_f, dest_file: Path, *, budget: list[int], known_size: int | None = None) -> None:
+    if known_size is not None and known_size > MAX_SINGLE_MEMBER_BYTES:
+        raise ValueError(f"压缩包内单文件过大（>{MAX_SINGLE_MEMBER_BYTES // 1024 // 1024}MB）：{dest_file.name}")
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with open(dest_file, "wb") as out:
+        while True:
+            chunk = src_f.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > MAX_SINGLE_MEMBER_BYTES:
+                raise ValueError(
+                    f"压缩包内单文件过大（>{MAX_SINGLE_MEMBER_BYTES // 1024 // 1024}MB）：{dest_file.name}"
+                )
+            if budget[0] + written > MAX_EXTRACT_TOTAL_BYTES:
+                raise ValueError(f"解压体积超过上限（{MAX_EXTRACT_TOTAL_BYTES // 1024 // 1024 // 1024}GB）")
+            out.write(chunk)
+    budget[0] += written
+
+
+def extract_archive_to(archive: Path, dest: Path) -> None:
+    """把压缩包安全解压到 dest。"""
+    kind = archive_kind(archive)
+    if not kind:
+        raise ValueError("不是支持的压缩包格式")
+    dest.mkdir(parents=True, exist_ok=True)
+    budget = [0]
+
+    if kind == ".zip":
+        with zipfile.ZipFile(archive, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                target = _safe_join(dest, info.filename)
+                if target is None:
+                    continue
+                # 优先解压可能是小说的文件，其它也解出来以便嵌套判断
+                with zf.open(info, "r") as src:
+                    _copy_limited(src, target, budget=budget, known_size=info.file_size)
+
+    elif kind == ".7z":
+        try:
+            import py7zr
+        except ImportError as exc:
+            raise ValueError("读取 .7z 需要安装 py7zr 库") from exc
+        with py7zr.SevenZipFile(archive, mode="r") as zf:
+            targets: list[str] = []
+            total_uncompressed = 0
+            for info in zf.list():
+                if info.is_directory:
+                    continue
+                if _safe_join(dest, info.filename) is None:
+                    continue
+                size = int(getattr(info, "uncompressed", 0) or 0)
+                if size > MAX_SINGLE_MEMBER_BYTES:
+                    raise ValueError(
+                        f"压缩包内单文件过大（>{MAX_SINGLE_MEMBER_BYTES // 1024 // 1024}MB）：{info.filename}"
+                    )
+                total_uncompressed += size
+                if total_uncompressed > MAX_EXTRACT_TOTAL_BYTES:
+                    raise ValueError(
+                        f"解压体积超过上限（{MAX_EXTRACT_TOTAL_BYTES // 1024 // 1024 // 1024}GB）"
+                    )
+                targets.append(info.filename)
+            if targets:
+                zf.extract(targets=targets, path=str(dest))
+            budget[0] += total_uncompressed
+
+    elif kind == ".rar":
+        try:
+            import rarfile
+        except ImportError as exc:
+            raise ValueError("读取 .rar 需要安装 rarfile，并配置 UnRAR") from exc
+        try:
+            with rarfile.RarFile(archive) as rf:
+                for info in rf.infolist():
+                    if info.is_dir():
+                        continue
+                    target = _safe_join(dest, info.filename)
+                    if target is None:
+                        continue
+                    with rf.open(info) as src:
+                        _copy_limited(src, target, budget=budget, known_size=getattr(info, "file_size", None))
+        except Exception as exc:
+            raise ValueError(
+                f"无法解压 RAR（可先转为 zip/7z）。详情：{exc}"
+            ) from exc
+
+    elif kind in {".tar", ".tgz", ".tbz2", ".txz", ".tar.gz", ".tar.bz2", ".tar.xz"}:
+        mode = "r:*"
+        with tarfile.open(archive, mode) as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                target = _safe_join(dest, member.name)
+                if target is None:
+                    continue
+                src = tf.extractfile(member)
+                if src is None:
+                    continue
+                with src:
+                    _copy_limited(src, target, budget=budget, known_size=member.size)
+
+    elif kind == ".gz":
+        # 单文件 gzip（如 novel.txt.gz）
+        out_name = archive.name[:-3] if archive.name.lower().endswith(".gz") else archive.stem
+        if Path(out_name).suffix.lower() not in NOVEL_SUFFIXES:
+            out_name = f"{archive.stem}.txt"
+        target = dest / Path(out_name).name
+        with gzip.open(archive, "rb") as src:
+            _copy_limited(src, target, budget=budget)
+
+    else:
+        raise ValueError(f"暂不支持的压缩格式：{kind}")
+
+
+def collect_novels_under(root: Path, limit: int = MAX_ARCHIVE_NOVELS) -> list[Path]:
+    found: list[Path] = []
+    try:
+        iterator = sorted(root.rglob("*"), key=lambda p: str(p).lower())
+    except Exception:
+        iterator = list(root.rglob("*"))
+    for p in iterator:
+        if is_novel_file(p):
+            found.append(p)
+            if len(found) >= limit:
+                break
+    return found
+
+
+def expand_import_path(path: Path) -> tuple[list[Path], str | None]:
+    """把普通小说或压缩包展开为可加入书架的文件列表。"""
+    path = Path(path)
+    if not path.exists():
+        return [], f"文件不存在：{path.name}"
+    if is_novel_file(path):
+        return [path.resolve()], None
+    if not is_archive_file(path):
+        return [], f"不支持的格式：{path.suffix or path.name}"
+
+    try:
+        size = path.stat().st_size
+    except Exception:
+        size = 0
+    if size > MAX_ARCHIVE_BYTES:
+        return [], f"压缩包超过 {MAX_ARCHIVE_BYTES // 1024 // 1024}MB 上限（当前约 {size // 1024 // 1024}MB）"
+
+    ensure_app_dir()
+    dest = IMPORT_EXTRACT_DIR / f"{path.stem}_{book_id_for_path(path)[:10]}"
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    try:
+        extract_archive_to(path, dest)
+    except Exception as exc:
+        shutil.rmtree(dest, ignore_errors=True)
+        return [], f"{path.name} 解压失败：{exc}"
+
+    novels = collect_novels_under(dest)
+    if not novels:
+        return [], f"{path.name} 内未找到 txt/pdf/epub/docx 等小说文件"
+    return novels, None
+
+
+def expand_import_paths(paths: list[Path]) -> tuple[list[Path], list[str]]:
+    """批量展开，保持顺序并去重。"""
+    expanded: list[Path] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        novels, err = expand_import_path(Path(raw))
+        if err:
+            errors.append(err)
+            continue
+        for n in novels:
+            try:
+                key = str(n.resolve())
+            except Exception:
+                key = str(n)
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append(n)
+    return expanded, errors
 
 
 def load_library() -> dict:
@@ -265,7 +527,14 @@ def read_text_file(path: Path) -> str:
 
 
 def _normalize_extracted_text(text: str) -> str:
+    if not text:
+        return ""
+    # 大文件避免多次全量正则；先统一换行再做轻量压缩
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) > 800_000:
+        # 超大文本：只压连续空行，跳过行尾空白扫描
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -468,22 +737,33 @@ def read_document(path: Path) -> str:
     return text
 
 
+def _is_chapter_heading(line: str) -> bool:
+    s = line.strip()
+    if not s or len(s) > 80:
+        return False
+    return CHAPTER_HEADING_RE.match(s) is not None
+
+
 def split_chapters(text: str) -> list[tuple[str, str]]:
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     chapters: list[tuple[str, list[str]]] = []
     current_title = "正文"
     current_lines: list[str] = []
+    current_has_text = False
 
     for line in lines:
-        if any(p.match(line.strip()) for p in CHAPTER_PATTERNS) and line.strip():
-            if current_lines and "".join(current_lines).strip():
+        if _is_chapter_heading(line):
+            if current_has_text:
                 chapters.append((current_title, current_lines))
             current_title = clean_chapter_title(line)[:120]
             current_lines = []
+            current_has_text = False
         else:
             current_lines.append(line)
+            if not current_has_text and line.strip():
+                current_has_text = True
 
-    if current_lines and "".join(current_lines).strip():
+    if current_has_text:
         chapters.append((clean_chapter_title(current_title), current_lines))
 
     if not chapters:
@@ -493,7 +773,7 @@ def split_chapters(text: str) -> list[tuple[str, str]]:
     for title, body_lines in chapters:
         body = "\n".join(body_lines).strip()
         if body:
-            result.append((clean_chapter_title(title), body))
+            result.append((title, body))
     return result or [("全文", text)]
 
 
@@ -1610,10 +1890,15 @@ class App(ctk.CTk):
         self.sentence_index = 0
         self.playing = False
         self.paused = False
-        self._chapter_rows: dict[int, ctk.CTkFrame] = {}
+        self._chapter_rows: dict[int, ctk.CTkButton] = {}
         self._book_rows: dict[str, ctk.CTkFrame] = {}
         self._chapter_filter = ""
         self._sidebar_mode = "目录"  # 书架 / 目录
+        self._chapter_fill_token = 0
+        self._load_token = 0
+        self._chapter_listbox: tk.Listbox | None = None
+        self._chapter_listbox_ids: list[int] = []
+        self._listbox_hi_idx: int | None = None
         self.library = load_library()
         self.current_book_id: str | None = self.library.get("current_id")
         self.content_matches: list[tuple[int, int, int, str]] = []
@@ -1770,16 +2055,16 @@ class App(ctk.CTk):
         )
         self.btn_sidebar_action.grid(row=0, column=1, padx=(0, 4))
 
-        self.chapter_list = ctk.CTkScrollableFrame(
+        self.sidebar_list_host = ctk.CTkFrame(
             sidebar,
-            label_text="",
             fg_color=self.theme["panel"],
             corner_radius=12,
             border_width=0,
-            scrollbar_button_color=self.theme["chip"],
-            scrollbar_button_hover_color=self.theme["accent"],
         )
-        self.chapter_list.grid(row=5, column=0, padx=12, pady=(0, 14), sticky="nsew")
+        self.sidebar_list_host.grid(row=5, column=0, padx=12, pady=(0, 14), sticky="nsew")
+        self.chapter_list = self.sidebar_list_host
+        self._chapter_listbox: tk.Listbox | None = None
+        self._chapter_listbox_ids: list[int] = []
         self._refresh_sidebar_list()
 
         # —— 右侧主区域 ——
@@ -1801,7 +2086,7 @@ class App(ctk.CTk):
         )
         self.title_label.grid(row=0, column=0, sticky="w")
         self.file_label = ctk.CTkLabel(
-            top, text="支持 txt / pdf / doc / docx / epub 等", font=self.font_small, text_color=self.theme["muted"], anchor="w"
+            top, text="支持 txt / pdf / epub / zip / 7z 等", font=self.font_small, text_color=self.theme["muted"], anchor="w"
         )
         self.file_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
@@ -1903,11 +2188,11 @@ class App(ctk.CTk):
         self.text_box.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 4))
         self._set_reader_text(
             "欢迎使用听小说\n\n"
-            "1. 左侧「导入小说」可一次加入多本，或「导入文件夹」批量添加\n"
-            "2. 在「书架」里点选要听的书；「目录」里跳转章节\n"
-            "3. 底部选择「讲书音色」，点播放开始收听\n"
-            "4. 单击正文可从该位置开始听；拖动进度条可跳转\n\n"
-            "朗读时正文会高亮并自动跟随滚动。"
+            "1. 左侧「导入小说」可一次加入多本，也支持 zip / 7z 等压缩包\n"
+            "2. 「导入文件夹」可批量添加；压缩包会自动解压出其中的小说\n"
+            "3. 在「书架」里点选要听的书；「目录」里跳转章节\n"
+            "4. 底部选择「讲书音色」，点播放开始收听\n\n"
+            "单击正文可从该位置开始听；朗读时正文会高亮跟随。"
         )
         self._setup_reader_readonly()
         try:
@@ -2232,11 +2517,32 @@ class App(ctk.CTk):
         self._set_speed(self.speed_value + delta)
 
     def _clear_chapter_buttons(self) -> None:
-        for child in self.chapter_list.winfo_children():
+        self._chapter_fill_token += 1  # 取消进行中的分批渲染
+        host = getattr(self, "sidebar_list_host", None) or self.chapter_list
+        for child in host.winfo_children():
             child.destroy()
+        self.chapter_list = host
         self._chapter_rows.clear()
         if hasattr(self, "_book_rows"):
             self._book_rows.clear()
+        self._chapter_listbox = None
+        self._chapter_listbox_ids = []
+
+    def _make_scrollable_list(self) -> ctk.CTkScrollableFrame:
+        """书架等需要自定义行时使用可滚动容器。"""
+        self._clear_chapter_buttons()
+        sf = ctk.CTkScrollableFrame(
+            self.sidebar_list_host,
+            label_text="",
+            fg_color=self.theme["panel"],
+            corner_radius=0,
+            border_width=0,
+            scrollbar_button_color=self.theme["chip"],
+            scrollbar_button_hover_color=self.theme["accent"],
+        )
+        sf.pack(fill="both", expand=True, padx=4, pady=4)
+        self.chapter_list = sf
+        return sf
 
     def _on_sidebar_mode(self, value: str) -> None:
         self._sidebar_mode = value
@@ -2272,7 +2578,7 @@ class App(ctk.CTk):
             self._fill_chapters()
 
     def _show_catalog_placeholder(self) -> None:
-        self._clear_chapter_buttons()
+        self._make_scrollable_list()
         self.catalog_count_label.configure(text="未加载")
         tip = ctk.CTkLabel(
             self.chapter_list,
@@ -2285,7 +2591,8 @@ class App(ctk.CTk):
         tip.pack(fill="x", padx=12, pady=20)
 
     def _show_bookshelf_placeholder(self) -> None:
-        self._clear_chapter_buttons()
+        if self.chapter_list is getattr(self, "sidebar_list_host", None):
+            self._make_scrollable_list()
         self.catalog_count_label.configure(text="0 本")
         tip = ctk.CTkLabel(
             self.chapter_list,
@@ -2317,7 +2624,7 @@ class App(ctk.CTk):
         return q in title or q in path or q in Path(path).name.lower()
 
     def _fill_books(self) -> None:
-        self._clear_chapter_buttons()
+        self._make_scrollable_list()
         books = list(self.library.get("books") or [])
         books.sort(key=lambda b: float(b.get("added_at") or 0), reverse=True)
         if not books:
@@ -2440,90 +2747,137 @@ class App(ctk.CTk):
             self._show_catalog_placeholder()
             return
 
-        visible = 0
-        for idx, (title, body) in enumerate(self.chapters):
+        items: list[tuple[int, str]] = []
+        for idx, (title, _body) in enumerate(self.chapters):
             if not self._chapter_matches_filter(idx, title):
                 continue
-            visible += 1
-            self._add_chapter_row(idx, title, body)
+            items.append((idx, title))
 
+        visible = len(items)
         if self._chapter_filter:
             self.catalog_count_label.configure(text=f"显示 {visible}/{total} 章")
         else:
             self.catalog_count_label.configure(text=f"共 {total} 章")
 
         if visible == 0:
+            self._make_scrollable_list()
             ctk.CTkLabel(
                 self.chapter_list,
                 text="没有匹配的章节\n请换个关键词试试",
                 text_color=self.theme["muted"],
                 justify="left",
             ).pack(fill="x", padx=10, pady=16)
-        else:
-            self.after(60, self._scroll_to_current_chapter)
+            return
+
+        # 原生 Listbox：上千章也几乎瞬间完成（CTk 按钮目录会卡数秒）
+        host = ctk.CTkFrame(self.sidebar_list_host, fg_color=self.theme["panel"], corner_radius=0)
+        host.pack(fill="both", expand=True, padx=4, pady=4)
+        lb = tk.Listbox(
+            host,
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            exportselection=False,
+            font=("Microsoft YaHei UI", 11),
+            bg=self.theme["panel"],
+            fg=self.theme["text"],
+            selectbackground=self.theme["accent"],
+            selectforeground=self.theme["on_accent"],
+            relief="flat",
+        )
+        sb = tk.Scrollbar(
+            host,
+            orient="vertical",
+            command=lb.yview,
+            bg=self.theme["panel"],
+            troughcolor=self.theme["panel"],
+            activebackground=self.theme["chip"],
+        )
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        lb.pack(side="left", fill="both", expand=True)
+
+        self._chapter_listbox = lb
+        self._chapter_listbox_ids = []
+        self._listbox_hi_idx = self.chapter_index
+        select_at = 0
+        for row, (idx, title) in enumerate(items):
+            mark = "▶ " if idx == self.chapter_index else "   "
+            lb.insert("end", f"{idx + 1:03d} {mark}{title}")
+            self._chapter_listbox_ids.append(idx)
+            if idx == self.chapter_index:
+                select_at = row
+
+        if items:
+            lb.selection_set(select_at)
+            lb.activate(select_at)
+            lb.see(select_at)
+        lb.bind("<<ListboxSelect>>", self._on_chapter_listbox_select)
+
+    def _on_chapter_listbox_select(self, _event=None) -> None:
+        lb = self._chapter_listbox
+        if lb is None:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        row = int(sel[0])
+        if row < 0 or row >= len(self._chapter_listbox_ids):
+            return
+        idx = self._chapter_listbox_ids[row]
+        if idx == self.chapter_index:
+            return
+        self.load_chapter(idx, autoplay=False, refresh_catalog=False)
+        self._refresh_chapter_highlight()
+
+    def _chapter_btn_colors(self, is_current: bool) -> dict:
+        if is_current:
+            return {
+                "fg_color": self.theme["accent_dim"],
+                "hover_color": self.theme["chip"],
+                "text_color": self.theme["accent"],
+            }
+        return {
+            "fg_color": self.theme["panel_soft"],
+            "hover_color": self.theme["chip_hover"],
+            "text_color": self.theme["text"],
+        }
 
     def _add_chapter_row(self, idx: int, title: str, body: str) -> None:
+        """兼容旧路径：小列表时仍可按按钮渲染（当前目录已改用 Listbox）。"""
+        if idx in self._chapter_rows:
+            return
         is_current = idx == self.chapter_index
-        bg = self.theme["accent_dim"] if is_current else self.theme["panel_soft"]
-        hover = self.theme["chip"] if is_current else self.theme["chip_hover"]
-        accent = self.theme["accent"] if is_current else self.theme["chip"]
-
-        row = ctk.CTkFrame(self.chapter_list, fg_color=bg, corner_radius=10, cursor="hand2")
-        row.pack(fill="x", padx=6, pady=3)
-        row.grid_columnconfigure(1, weight=1)
-        self._chapter_rows[idx] = row
-
-        num = ctk.CTkLabel(
-            row,
-            text=f"{idx + 1:02d}" if idx + 1 < 100 else str(idx + 1),
-            width=40,
-            height=40,
+        mark = "▶ " if is_current else ""
+        label = f"{idx + 1:03d}  {mark}{title}"
+        if len(body) >= 1000:
+            label = f"{label}  · {format_count(len(body))}"
+        btn = ctk.CTkButton(
+            self.chapter_list,
+            text=label[:72] + ("…" if len(label) > 72 else ""),
+            anchor="w",
+            height=34,
             corner_radius=8,
-            fg_color=accent,
-            text_color=self.theme["on_accent"] if is_current else self.theme["muted"],
-            font=ctk.CTkFont(family="Microsoft YaHei UI", size=12, weight="bold"),
+            font=self.font_ui,
+            command=lambda i=idx: self.load_chapter(i, autoplay=False),
+            **self._chapter_btn_colors(is_current),
         )
-        num.grid(row=0, column=0, rowspan=2, padx=(8, 8), pady=8, sticky="ns")
-
-        mark = "正在听 · " if is_current else ""
-        title_lbl = ctk.CTkLabel(
-            row,
-            text=f"{mark}{title}",
-            anchor="w",
-            justify="left",
-            wraplength=200,
-            font=ctk.CTkFont(
-                family="Microsoft YaHei UI",
-                size=13,
-                weight="bold" if is_current else "normal",
-            ),
-            text_color=self.theme["accent"] if is_current else self.theme["text"],
-        )
-        title_lbl.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(8, 0))
-
-        meta = ctk.CTkLabel(
-            row,
-            text=format_count(len(body)),
-            anchor="w",
-            text_color=self.theme["accent"] if is_current else self.theme["faint"],
-            font=self.font_small,
-        )
-        meta.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(2, 8))
-
-        def bind_click(widget, i=idx):
-            widget.bind("<Button-1>", lambda _e, chapter=i: self.load_chapter(chapter, autoplay=False))
-            widget.bind("<Enter>", lambda _e, r=row: r.configure(fg_color=hover))
-            widget.bind(
-                "<Leave>",
-                lambda _e, r=row, cur=is_current: r.configure(
-                    fg_color=self.theme["accent_dim"] if cur else self.theme["panel_soft"]
-                ),
-            )
-
-        for w in (row, num, title_lbl, meta):
-            bind_click(w)
+        btn.pack(fill="x", padx=6, pady=2)
+        self._chapter_rows[idx] = btn
 
     def _scroll_to_current_chapter(self) -> None:
+        lb = self._chapter_listbox
+        if lb is not None and self._chapter_listbox_ids:
+            try:
+                if self.chapter_index in self._chapter_listbox_ids:
+                    row = self._chapter_listbox_ids.index(self.chapter_index)
+                    lb.selection_clear(0, "end")
+                    lb.selection_set(row)
+                    lb.activate(row)
+                    lb.see(row)
+            except Exception:
+                pass
+            return
         row = self._chapter_rows.get(self.chapter_index)
         if not row:
             return
@@ -2537,10 +2891,53 @@ class App(ctk.CTk):
             pass
 
     def _refresh_chapter_highlight(self) -> None:
-        """切换章节后刷新目录高亮；在书架模式下不打断列表。"""
+        """切换章节后尽量就地改色，避免整表重建导致卡顿。"""
         if getattr(self, "_sidebar_mode", "目录") != "目录":
             return
-        self._fill_chapters()
+
+        lb = self._chapter_listbox
+        if lb is not None and self._chapter_listbox_ids:
+            try:
+                prev = getattr(self, "_listbox_hi_idx", None)
+                for idx in {prev, self.chapter_index}:
+                    if idx is None or idx not in self._chapter_listbox_ids:
+                        continue
+                    row = self._chapter_listbox_ids.index(idx)
+                    title = self.chapters[idx][0] if 0 <= idx < len(self.chapters) else ""
+                    mark = "▶ " if idx == self.chapter_index else "   "
+                    lb.delete(row)
+                    lb.insert(row, f"{idx + 1:03d} {mark}{title}")
+                self._listbox_hi_idx = self.chapter_index
+                if self.chapter_index in self._chapter_listbox_ids:
+                    row = self._chapter_listbox_ids.index(self.chapter_index)
+                    lb.selection_clear(0, "end")
+                    lb.selection_set(row)
+                    lb.activate(row)
+                    lb.see(row)
+            except Exception:
+                self._fill_chapters()
+            return
+
+        if self._chapter_filter or not self._chapter_rows:
+            self._fill_chapters()
+            return
+
+        for idx, btn in self._chapter_rows.items():
+            is_current = idx == self.chapter_index
+            title = self.chapters[idx][0] if 0 <= idx < len(self.chapters) else ""
+            body = self.chapters[idx][1] if 0 <= idx < len(self.chapters) else ""
+            mark = "▶ " if is_current else ""
+            label = f"{idx + 1:03d}  {mark}{title}"
+            if len(body) >= 1000:
+                label = f"{label}  · {format_count(len(body))}"
+            try:
+                btn.configure(
+                    text=label[:72] + ("…" if len(label) > 72 else ""),
+                    **self._chapter_btn_colors(is_current),
+                )
+            except Exception:
+                pass
+        self.after(40, self._scroll_to_current_chapter)
 
     def _library_books(self) -> list[dict]:
         books = self.library.get("books")
@@ -2641,7 +3038,7 @@ class App(ctk.CTk):
             self.sentence_index = 0
             self.stop_play()
             self.title_label.configure(text="打开一本小说，开始收听")
-            self.file_label.configure(text="支持 txt / pdf / doc / docx / epub 等")
+            self.file_label.configure(text="支持 txt / pdf / epub / zip / 7z 等")
             self._set_reader_text("已从书架移除。可继续导入其他小说。")
             self._setup_progress_slider()
             self._update_progress_ui(0)
@@ -2684,69 +3081,185 @@ class App(ctk.CTk):
 
     def import_novels(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="选择一本或多本小说",
+            title="选择小说或压缩包（可多选）",
             filetypes=NOVEL_FILETYPES,
         )
         if not paths:
             return
-        added = self.add_paths_to_library([Path(p) for p in paths], switch_to_first=True)
-        self._sidebar_mode = "书架"
-        if hasattr(self, "sidebar_mode"):
-            self.sidebar_mode.set("书架")
-        self._refresh_sidebar_list()
-        if added:
-            self._ui_status(f"已导入 {len(added)} 本到书架")
-        else:
-            self._ui_status("所选文件已在书架中")
+        self._ui_status("正在导入，大压缩包请稍候…")
+        self._set_reader_text("正在导入文件 / 解压压缩包…\n\n支持 zip / 7z / tar / gz 等，请稍候。")
+
+        selected = [Path(p) for p in paths]
+
+        def worker() -> None:
+            expanded, errors = expand_import_paths(selected)
+
+            def finish() -> None:
+                if not expanded:
+                    msg = "没有可导入的小说文件。"
+                    if errors:
+                        msg += "\n\n" + "\n".join(errors[:8])
+                    messagebox.showerror(APP_NAME, msg)
+                    self._ui_status("导入失败")
+                    return
+                added = self.add_paths_to_library(expanded, switch_to_first=True)
+                self._sidebar_mode = "书架"
+                if hasattr(self, "sidebar_mode"):
+                    self.sidebar_mode.set("书架")
+                self._refresh_sidebar_list()
+                tip = f"已导入 {len(added)} 本到书架（展开后共 {len(expanded)} 个文件）"
+                if errors:
+                    tip += f" · {len(errors)} 个压缩包有问题"
+                    messagebox.showwarning(APP_NAME, "部分文件未能导入：\n\n" + "\n".join(errors[:8]))
+                self._ui_status(tip)
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def import_folder(self) -> None:
-        folder = filedialog.askdirectory(title="选择包含小说的文件夹")
+        folder = filedialog.askdirectory(title="选择包含小说或压缩包的文件夹")
         if not folder:
             return
         root = Path(folder)
-        found: list[Path] = []
-        for p in root.rglob("*"):
-            if is_novel_file(p):
-                found.append(p)
-            if len(found) >= 300:
-                break
-        if not found:
-            messagebox.showinfo(APP_NAME, "该文件夹下没有找到可识别的小说文件。")
-            return
-        if len(found) > 80:
-            if not messagebox.askyesno(APP_NAME, f"找到 {len(found)} 个文件，是否全部加入书架？"):
+        self._ui_status("正在扫描文件夹…")
+
+        def worker() -> None:
+            found: list[Path] = []
+            archives: list[Path] = []
+            try:
+                for p in root.rglob("*"):
+                    if not p.is_file():
+                        continue
+                    if is_novel_file(p):
+                        found.append(p)
+                    elif is_archive_file(p):
+                        archives.append(p)
+                    if len(found) + len(archives) >= MAX_FOLDER_SCAN:
+                        break
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror(APP_NAME, f"扫描失败：\n{exc}"))
                 return
-        added = self.add_paths_to_library(found, switch_to_first=True)
-        self._sidebar_mode = "书架"
-        if hasattr(self, "sidebar_mode"):
-            self.sidebar_mode.set("书架")
-        self._refresh_sidebar_list()
-        self._ui_status(f"文件夹导入完成 · 新增 {len(added)} 本 · 合计扫描 {len(found)} 个")
+
+            errors: list[str] = []
+            for arc in archives:
+                novels, err = expand_import_path(arc)
+                if err:
+                    errors.append(err)
+                else:
+                    found.extend(novels)
+                if len(found) >= MAX_FOLDER_SCAN:
+                    found = found[:MAX_FOLDER_SCAN]
+                    break
+
+            # 去重
+            uniq: list[Path] = []
+            seen: set[str] = set()
+            for n in found:
+                try:
+                    key = str(n.resolve())
+                except Exception:
+                    key = str(n)
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(n)
+
+            def finish() -> None:
+                if not uniq:
+                    msg = "该文件夹下没有找到可识别的小说文件。"
+                    if errors:
+                        msg += "\n\n" + "\n".join(errors[:6])
+                    messagebox.showinfo(APP_NAME, msg)
+                    self._ui_status("未找到可导入文件")
+                    return
+                if len(uniq) > 120:
+                    if not messagebox.askyesno(
+                        APP_NAME,
+                        f"找到 {len(uniq)} 个文件（含压缩包展开），是否全部加入书架？",
+                    ):
+                        return
+                added = self.add_paths_to_library(uniq, switch_to_first=True)
+                self._sidebar_mode = "书架"
+                if hasattr(self, "sidebar_mode"):
+                    self.sidebar_mode.set("书架")
+                self._refresh_sidebar_list()
+                tip = f"文件夹导入完成 · 新增 {len(added)} 本 · 合计 {len(uniq)} 个"
+                if archives:
+                    tip += f" · 解压 {len(archives)} 个压缩包"
+                self._ui_status(tip)
+                if errors:
+                    messagebox.showwarning(APP_NAME, "部分压缩包未能导入：\n\n" + "\n".join(errors[:8]))
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def open_file(self) -> None:
         self.import_novels()
 
     def load_novel(self, path: Path, restore: dict | None = None) -> None:
+        """后台读取/分章，避免大文件卡住界面。"""
         try:
-            text = read_document(path)
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, f"无法读取文件:\n{exc}")
-            return
-
-        if len(text) > 3_000_000:
+            size = path.stat().st_size
+        except Exception:
+            size = 0
+        if size > MAX_NOVEL_OPEN_WARN_BYTES:
+            mb = max(1, size // 1024 // 1024)
             if not messagebox.askyesno(
                 APP_NAME,
-                f"文件较大（约 {len(text) // 10000} 万字），加载可能稍慢，是否继续？",
+                f"文件约 {mb} MB，解析可能需要一点时间，是否继续？",
             ):
                 return
 
+        self._load_token += 1
+        token = self._load_token
+        display_name = path.name
+        self._ui_status(f"正在打开《{novel_display_title(path)}》…")
+        self._set_reader_text(
+            f"正在读取「{display_name}」\n\n大文件会在后台解析，界面不会卡住，请稍候…"
+        )
+        self.title_label.configure(text="正在加载…")
+        self.file_label.configure(text=display_name)
+
+        def worker() -> None:
+            err: Exception | None = None
+            text = ""
+            chapters: list[tuple[str, str]] = []
+            try:
+                text = read_document(path)
+                if token != self._load_token:
+                    return
+                chapters = split_chapters(text)
+            except Exception as exc:
+                err = exc
+
+            def finish() -> None:
+                if token != self._load_token:
+                    return
+                if err is not None:
+                    messagebox.showerror(APP_NAME, f"无法读取文件:\n{err}")
+                    self._ui_status("打开失败")
+                    return
+                self._apply_loaded_novel(path, text, chapters, restore)
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_loaded_novel(
+        self,
+        path: Path,
+        text: str,
+        chapters: list[tuple[str, str]],
+        restore: dict | None = None,
+    ) -> None:
         self.stop_play()
         try:
             path = path.resolve()
         except Exception:
             pass
 
-        # 加入书架（不递归切换）
         if not self._find_book(path=path):
             self.library.setdefault("books", []).append(
                 {
@@ -2763,7 +3276,7 @@ class App(ctk.CTk):
         self._persist_library()
 
         self.file_path = path
-        self.chapters = split_chapters(text)
+        self.chapters = chapters
         self.chapter_index = 0
         self.content_matches = []
         self.content_match_index = -1
@@ -2787,9 +3300,17 @@ class App(ctk.CTk):
         if hasattr(self, "sidebar_mode"):
             self.sidebar_mode.set("目录")
 
-        self.load_chapter(chapter_index, sentence_index=sentence_index, autoplay=False)
+        # 先显示正文，目录分批渲染；避免 load_chapter 与 sidebar 重复建表
+        self.load_chapter(
+            chapter_index,
+            sentence_index=sentence_index,
+            autoplay=False,
+            refresh_catalog=False,
+        )
         self._refresh_sidebar_list()
-        self._ui_status(f"正在听《{novel_display_title(path)}》· 共 {len(self.chapters)} 章")
+        self._ui_status(
+            f"正在听《{novel_display_title(path)}》· 共 {len(self.chapters)} 章 · {format_count(len(text))}"
+        )
 
     def load_chapter(
         self,
@@ -2797,6 +3318,7 @@ class App(ctk.CTk):
         sentence_index: int = 0,
         autoplay: bool = False,
         keep_search_highlight: bool = False,
+        refresh_catalog: bool = True,
     ) -> None:
         if not self.chapters:
             return
@@ -2809,7 +3331,8 @@ class App(ctk.CTk):
 
         self.title_label.configure(text=f"第 {self.chapter_index + 1} / {len(self.chapters)} 章 · {title}")
         self._set_reader_text(body)
-        self._refresh_chapter_highlight()
+        if refresh_catalog:
+            self._refresh_chapter_highlight()
         self._setup_progress_slider()
         self._update_progress_ui(self.sentence_index)
         if self.sentences:

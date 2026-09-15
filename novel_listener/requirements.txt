@@ -9,3 +9,4 @@ beautifulsoup4>=4.12.0
 lxml>=5.0.0
 striprtf>=0.0.26
 pywin32>=306
+py7zr>=0.22.0
