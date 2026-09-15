@@ -48,6 +48,7 @@ build_installer.bat 1.2.0
 | 找不到 ISCC.exe | `winget install JRSoftware.InnoSetup` |
 | 版本一直是 1.0.0 | 用 `build_installer.bat 1.2.0` 显式指定 |
 | 双击 bat 一闪而过 | 看报错；失败时脚本会 `pause` |
+| PowerShell 报 Unexpected token / 中文乱码 | 已用 UTF-8 BOM 修复，请拉取最新后再运行 `build_installer.bat 1.2.0` |
 
 ## 其他
 

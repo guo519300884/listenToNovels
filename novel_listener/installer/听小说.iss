@@ -1,4 +1,4 @@
-; 听小说 — Inno Setup 安装脚本
+﻿; 听小说 — Inno Setup 安装脚本
 ; 请用项目根目录 build_installer.bat / build_installer.ps1 打包（可自定义版本号）
 
 #define MyAppName "听小说"

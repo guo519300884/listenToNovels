@@ -1,5 +1,5 @@
-# 听小说 — 生成 Windows 安装包（支持自定义版本号）
-# 用法:
+﻿# Novel Listener - Windows installer builder (custom version)
+# Usage:
 #   .\build_installer.ps1
 #   .\build_installer.ps1 -Version 1.2.0
 #   build_installer.bat 1.2.0
@@ -11,7 +11,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
@@ -23,14 +22,27 @@ $OutDir = Join-Path $Root "发布"
 $VersionFile = Join-Path $Root "VERSION"
 $DefineFile = Join-Path $Root "novel_listener\installer\version_defines.iss"
 
+function Write-Info([string]$Message) {
+    Write-Host ("[INFO] " + $Message)
+}
+function Write-Ok([string]$Message) {
+    Write-Host ("[OK] " + $Message)
+}
+function Write-Warn([string]$Message) {
+    Write-Host ("[WARN] " + $Message)
+}
+
 Write-Host "========================================"
-Write-Host "  听小说 — 生成 Windows 安装包"
+Write-Host "  ListenNovel installer builder"
+Write-Host "  听小说 - 生成 Windows 安装包"
 Write-Host "========================================"
 Write-Host ""
 
 function Read-DefaultVersion {
-    if (Test-Path $VersionFile) {
-        $v = (Get-Content -LiteralPath $VersionFile -Raw -Encoding UTF8).Trim()
+    if (Test-Path -LiteralPath $VersionFile) {
+        $raw = Get-Content -LiteralPath $VersionFile -Raw -Encoding UTF8
+        if ($null -eq $raw) { return "1.0.0" }
+        $v = $raw.Trim().Trim([char]0xFEFF)
         if ($v) { return $v }
     }
     return "1.0.0"
@@ -39,22 +51,21 @@ function Read-DefaultVersion {
 function Normalize-VersionInfo([string]$ver) {
     $parts = @($ver.Split(".") | Where-Object { $_ -ne "" })
     if ($parts.Count -lt 1 -or $parts.Count -gt 4) {
-        throw "版本号最多 4 段，例如 1.2.3 或 1.2.3.4"
+        throw "Invalid version (max 4 parts): $ver"
     }
     foreach ($p in $parts) {
         if ($p -notmatch '^\d+$') {
-            throw "版本号每段必须是数字: $ver"
+            throw "Version parts must be digits: $ver"
         }
     }
     while ($parts.Count -lt 4) { $parts += "0" }
     return ($parts -join ".")
 }
 
-# ---------- 解析版本号 ----------
 if (-not $Version) {
     $default = Read-DefaultVersion
-    Write-Host "当前默认版本: $default"
-    $inputVer = Read-Host "请输入版本号（直接回车使用默认）"
+    Write-Host ("Default version: " + $default)
+    $inputVer = Read-Host "Enter version (Enter = default)"
     if ([string]::IsNullOrWhiteSpace($inputVer)) {
         $Version = $default
     } else {
@@ -65,78 +76,78 @@ if (-not $Version) {
 }
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
-    throw "版本号不能为空"
+    throw "Version is empty"
 }
 if ($Version -notmatch '^\d+(\.\d+){0,3}$') {
-    throw "版本号格式无效: $Version（请用 1.0.0 或 1.2.3.4）"
+    throw ("Invalid version format: " + $Version + " (use 1.0.0 or 1.2.3.4)")
 }
 
 $VerInfo = Normalize-VersionInfo $Version
-Set-Content -LiteralPath $VersionFile -Value $Version -Encoding ascii -NoNewline
-# 补一个换行，方便记事本查看
-Add-Content -LiteralPath $VersionFile -Value "" -Encoding ascii
 
-Write-Host "[信息] 安装包版本: $Version"
-Write-Host "[信息] 文件版本号: $VerInfo"
+# Write VERSION as ASCII to avoid BOM/CRLF issues on next run
+[System.IO.File]::WriteAllText($VersionFile, $Version + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+
+Write-Info ("Installer version = " + $Version)
+Write-Info ("File version      = " + $VerInfo)
 Write-Host ""
 
-# ---------- 准备主程序 ----------
 $AppExe = Join-Path $AppDir "听小说.exe"
 $DistExe = Join-Path $DistDir "听小说.exe"
 if (-not (Test-Path -LiteralPath $AppExe)) {
     if (Test-Path -LiteralPath $DistExe) {
-        Write-Host "[信息] 从 dist 复制听小说.exe ..."
+        Write-Info "Copy exe from dist ..."
         New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
         Copy-Item -LiteralPath $DistExe -Destination $AppExe -Force
     }
 }
 if (-not (Test-Path -LiteralPath $AppExe)) {
-    throw "找不到听小说.exe，请先运行 novel_listener\build_exe.bat"
+    throw "Missing 听小说.exe. Run novel_listener\build_exe.bat first."
 }
 if (-not (Test-Path -LiteralPath $Iss)) {
-    throw "找不到安装脚本: $Iss"
+    throw ("Missing ISS script: " + $Iss)
 }
 
-# ---------- 查找 ISCC ----------
 $isccCandidates = @(
     (Join-Path $env:LocalAppData "Programs\Inno Setup 6\ISCC.exe"),
-    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-    "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+    (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+    (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
 )
 $Iscc = $isccCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 if (-not $Iscc) {
-    throw "未找到 Inno Setup 6（ISCC.exe）。请先执行: winget install JRSoftware.InnoSetup"
+    throw "ISCC.exe not found. Install: winget install JRSoftware.InnoSetup"
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-# 用临时 defines 文件传版本，避免 cmd /D 引号被吃掉
+# Generate defines file as UTF-8 with BOM (Inno Setup friendly)
 $defineText = @"
-; 由 build_installer.ps1 自动生成，请勿手工长期修改
+; auto-generated by build_installer.ps1
 #define MyAppVersion "$Version"
 #define MyAppVersionInfo "$VerInfo"
 "@
-Set-Content -LiteralPath $DefineFile -Value $defineText -Encoding UTF8
+$utf8Bom = New-Object System.Text.UTF8Encoding $true
+[System.IO.File]::WriteAllText($DefineFile, $defineText, $utf8Bom)
 
 $outName = "听小说安装包_v$Version.exe"
-Write-Host "[信息] 编译安装包..."
-Write-Host "       脚本: $Iss"
-Write-Host "       输出: $(Join-Path $OutDir $outName)"
+Write-Info ("Compiling with: " + $Iscc)
+Write-Info ("ISS: " + $Iss)
+Write-Info ("OUT: " + (Join-Path $OutDir $outName))
 Write-Host ""
 
 & $Iscc $Iss
 if ($LASTEXITCODE -ne 0) {
-    throw "安装包编译失败（退出码 $LASTEXITCODE）"
+    throw ("ISCC failed, exit code " + $LASTEXITCODE)
 }
 
 $built = Join-Path $OutDir $outName
 if (-not (Test-Path -LiteralPath $built)) {
-    Write-Host "[警告] 未找到预期文件名，请检查 发布 目录中的 exe"
-    Get-ChildItem -LiteralPath $OutDir -Filter "*.exe" | ForEach-Object { Write-Host " - $($_.Name)" }
+    Write-Warn "Expected output file not found. Files in 发布:"
+    Get-ChildItem -LiteralPath $OutDir -Filter "*.exe" | ForEach-Object { Write-Host (" - " + $_.Name) }
 } else {
+    $mb = [math]::Round((Get-Item -LiteralPath $built).Length / 1MB, 1)
     Write-Host ""
-    Write-Host "[完成] 已生成: 发布\$outName"
-    Write-Host "       大小: $([math]::Round((Get-Item -LiteralPath $built).Length / 1MB, 1)) MB"
+    Write-Ok ("Created: 发布\" + $outName)
+    Write-Ok ("Size: " + $mb + " MB")
 }
 
 try { Invoke-Item $OutDir } catch {}

@@ -3,21 +3,36 @@ chcp 65001 >nul
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-REM 转发到 PowerShell，版本号自定义更稳定
-REM 用法:
+REM Forward to PowerShell (UTF-8 BOM script).
+REM Usage:
 REM   build_installer.bat
 REM   build_installer.bat 1.2.0
 
-if "%~1"=="" (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_installer.ps1"
+set "PS1=%~dp0build_installer.ps1"
+if not exist "%PS1%" (
+  echo [ERR] Missing build_installer.ps1
+  pause
+  exit /b 1
+)
+
+where pwsh >nul 2>nul
+if %ERRORLEVEL%==0 (
+  set "PSEXE=pwsh"
 ) else (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_installer.ps1" -Version "%~1"
+  set "PSEXE=powershell"
+)
+
+if "%~1"=="" (
+  "%PSEXE%" -NoProfile -ExecutionPolicy Bypass -File "%PS1%"
+) else (
+  "%PSEXE%" -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Version "%~1"
 )
 
 set "ERR=%ERRORLEVEL%"
 if not "%ERR%"=="0" (
   echo.
-  echo [失败] 打包未成功，退出码 %ERR%
+  echo [ERR] build failed, exit code %ERR%
+  echo Tip: open build_installer.ps1 in Notepad and confirm it is UTF-8.
   pause
 )
 exit /b %ERR%
