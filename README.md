@@ -81,13 +81,15 @@ novel_listener\build_exe.bat
 winget install JRSoftware.InnoSetup
 ```
 
-然后在项目根目录执行：
+然后在项目根目录执行（可自定义版本号）：
 
 ```bat
-build_installer.bat
+build_installer.bat 1.2.0
 ```
 
-安装包输出到：`发布/听小说安装包_v1.0.0.exe`。
+或不带参数双击运行，按提示输入版本号。  
+安装包输出到：`发布/听小说安装包_v1.2.0.exe`（文件名随版本变化）。  
+默认版本保存在根目录 `VERSION` 文件中。
 
 ## 项目结构
 
@@ -100,7 +102,8 @@ PC_TS/
 │   └── installer/           # Inno Setup 安装脚本
 ├── 听小说应用/              # 绿色版交付（exe + 说明）
 ├── 发布/                    # 安装包输出目录
-└── build_installer.bat      # 一键生成安装包
+├── VERSION                  # 当前默认版本号
+└── build_installer.bat      # 一键生成安装包（支持自定义版本）
 ```
 
 ## 技术栈
