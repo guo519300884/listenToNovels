@@ -93,6 +93,12 @@ build_installer.bat
 
 若提示找不到 `ISCC.exe`，说明还没装好 Inno Setup 6，或未装到默认路径。
 
+若 PowerShell 报 `Unexpected token` / 中文乱码，请确认已拉取最新脚本（`build_installer.ps1` 需为 **UTF-8 带 BOM**），然后重新执行：
+
+```bat
+build_installer.bat 1.2.0
+```
+
 ---
 
 ## 目录说明
