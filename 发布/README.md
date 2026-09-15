@@ -20,10 +20,10 @@ novel_listener\build_exe.bat
 
 ### 2. 再打安装包（自定义版本）
 
-在项目**根目录**：
+在项目**根目录**（若在 PowerShell 中，必须加 `.\`）：
 
-```bat
-build_installer.bat 1.2.0
+```powershell
+.\build_installer.bat 1.2.0
 ```
 
 或双击 `build_installer.bat`，按提示输入版本号。
@@ -46,9 +46,10 @@ build_installer.bat 1.2.0
 |------|------|
 | 找不到听小说.exe | 先运行 `novel_listener\build_exe.bat` |
 | 找不到 ISCC.exe | `winget install JRSoftware.InnoSetup` |
-| 版本一直是 1.0.0 | 用 `build_installer.bat 1.2.0` 显式指定 |
+| 版本一直是 1.0.0 | 用 `.\build_installer.bat 1.2.0` 显式指定 |
+| PowerShell 提示无法识别 bat | 写成 `.\build_installer.bat 1.2.0`（不要漏掉 `.\`） |
 | 双击 bat 一闪而过 | 看报错；失败时脚本会 `pause` |
-| PowerShell 报 Unexpected token / 中文乱码 | 已用 UTF-8 BOM 修复，请拉取最新后再运行 `build_installer.bat 1.2.0` |
+| PowerShell 报 Unexpected token / 中文乱码 | 拉取最新后再运行 `.\build_installer.bat 1.2.0` |
 
 ## 其他
 

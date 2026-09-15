@@ -75,12 +75,11 @@ winget install JRSoftware.InnoSetup
 
 再在**项目根目录**执行：
 
-```bat
-REM 方式 A：命令行指定版本（推荐）
-build_installer.bat 1.2.0
+```powershell
+# PowerShell 里必须加 .\
+.\build_installer.bat 1.2.0
 
-REM 方式 B：双击运行，按提示输入版本号
-build_installer.bat
+# 或双击 build_installer.bat，按提示输入版本号
 ```
 
 成功后得到：
@@ -91,14 +90,13 @@ build_installer.bat
 
 版本号会写入根目录 `VERSION`，下次默认沿用。
 
-若提示找不到 `ISCC.exe`，说明还没装好 Inno Setup 6，或未装到默认路径。
+常见问题：
 
-若 PowerShell 报 `Unexpected token` / 中文乱码，请确认已拉取最新脚本（`build_installer.ps1` 需为 **UTF-8 带 BOM**），然后重新执行：
-
-```bat
-build_installer.bat 1.2.0
-```
-
+| 现象 | 处理 |
+|------|------|
+| `无法将 build_installer.bat 项识别为...` | PowerShell 要写 `.\build_installer.bat 1.2.0` |
+| 找不到 `ISCC.exe` | `winget install JRSoftware.InnoSetup` |
+| `Unexpected token` / 中文乱码 | 拉取最新脚本后再试（ps1 需 UTF-8 BOM） |
 ---
 
 ## 目录说明
