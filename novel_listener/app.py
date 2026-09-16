@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import array
 import asyncio
 import ctypes
 import gzip
@@ -14,6 +15,7 @@ import shutil
 import tarfile
 import threading
 import time
+import wave
 import zipfile
 from ctypes import wintypes
 from pathlib import Path
@@ -22,6 +24,7 @@ import tkinter as tk
 
 import customtkinter as ctk
 import edge_tts
+import miniaudio
 import pygame
 
 APP_NAME = "听小说"
@@ -809,14 +812,74 @@ def merge_speech_chunks(sentences: list[str], max_chars: int = 280) -> list[tupl
     return chunks
 
 
+# Edge TTS rate 实际上限约 +200%（≈3.0x），更高倍速需本地加速补齐
+TTS_MAX_SPEED = 3.0
+
+
+def split_speed(speed: float) -> tuple[float, float]:
+    """总倍速拆成 Edge TTS 语速 + 本地播放加速因子。"""
+    speed = max(0.5, min(5.0, float(speed)))
+    tts = min(speed, TTS_MAX_SPEED)
+    play = speed / tts if tts > 0 else 1.0
+    return tts, play
+
+
 def speed_to_rate(speed: float) -> str:
-    """把 0.5~5.0 倍速转为 edge-tts rate 字符串。"""
+    """把 TTS 倍速转为 edge-tts rate 字符串（建议先经 split_speed）。"""
     pct = int(round((speed - 1.0) * 100))
+    pct = max(-50, min(200, pct))
     return f"{pct:+d}%"
 
 
 def speed_label(speed: float) -> str:
     return f"{speed:.1f}x"
+
+
+def apply_playback_speed(src: Path, dst: Path, factor: float) -> None:
+    """按 factor 加速音频（缩短时长，音调随之升高），写出 24kHz 单声道 WAV。"""
+    if factor <= 1.01:
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
+        return
+
+    decoded = miniaudio.decode_file(
+        str(src),
+        output_format=miniaudio.SampleFormat.SIGNED16,
+        nchannels=1,
+        sample_rate=24000,
+    )
+    pcm = decoded.samples
+    if not isinstance(pcm, array.array):
+        buf = array.array("h")
+        buf.frombytes(bytes(pcm))
+        pcm = buf
+    elif pcm.typecode != "h":
+        buf = array.array("h")
+        buf.frombytes(pcm.tobytes())
+        pcm = buf
+
+    n = len(pcm)
+    if n <= 1:
+        shutil.copy2(src, dst)
+        return
+
+    new_n = max(1, int(n / factor))
+    out = array.array("h")
+    for i in range(new_n):
+        pos = i * factor
+        i0 = int(pos)
+        if i0 >= n - 1:
+            out.append(pcm[n - 1])
+        else:
+            frac = pos - i0
+            out.append(int(pcm[i0] * (1.0 - frac) + pcm[i0 + 1] * frac))
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(dst), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(out.tobytes())
 
 
 def offset_to_sentence_index(body: str, offset: int) -> int:
@@ -1613,10 +1676,20 @@ class NeuralPlayer:
             pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=4096)
             self._mixer_ready = True
 
-    def _cache_path(self, text: str) -> Path:
-        # v2：勿把整段 SSML 当正文传给 edge-tts（会被二次转义，朗读成标签）
+    def _cache_path(self, text: str, play_factor: float) -> Path:
+        # v3：TTS 语速与本地加速因子分开缓存；>3x 最终文件为 WAV
+        tts_speed, _ = split_speed(self._speed)
         key = hashlib.md5(
-            f"v2|{self._voice_key}|{self._pitch}|{speed_to_rate(self._speed)}|{text}".encode(
+            f"v3|{self._voice_key}|{self._pitch}|{speed_to_rate(tts_speed)}|{play_factor:.3f}|{text}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        ext = ".wav" if play_factor > 1.01 else ".mp3"
+        return CACHE_DIR / f"{key}{ext}"
+
+    def _raw_tts_cache_path(self, text: str, tts_speed: float) -> Path:
+        key = hashlib.md5(
+            f"v3raw|{self._voice_key}|{self._pitch}|{speed_to_rate(tts_speed)}|{text}".encode(
                 "utf-8"
             )
         ).hexdigest()
@@ -1683,9 +1756,9 @@ class NeuralPlayer:
                 pass
         self._temp_files.clear()
 
-    async def _synthesize(self, text: str, out_path: Path) -> None:
+    async def _synthesize(self, text: str, out_path: Path, tts_speed: float) -> None:
         # edge-tts 会自行包装 SSML；只能传纯文本，否则会朗读 XML 标签
-        rate = speed_to_rate(self._speed)
+        rate = speed_to_rate(tts_speed)
         communicate = edge_tts.Communicate(
             text,
             voice=self._voice_id,
@@ -1697,10 +1770,22 @@ class NeuralPlayer:
             raise RuntimeError("语音文件为空，请检查网络后重试")
 
     def _prepare_audio(self, text: str, loop: asyncio.AbstractEventLoop) -> Path:
-        cached = self._cache_path(text)
+        tts_speed, play_factor = split_speed(self._speed)
+        cached = self._cache_path(text, play_factor)
         if cached.exists() and cached.stat().st_size > 0:
             return cached
-        loop.run_until_complete(self._synthesize(text, cached))
+
+        if play_factor <= 1.01:
+            loop.run_until_complete(self._synthesize(text, cached, tts_speed))
+            return cached
+
+        # >3x：先按 TTS 上限合成，再本地加速到目标倍速
+        raw = self._raw_tts_cache_path(text, tts_speed)
+        if not (raw.exists() and raw.stat().st_size > 0):
+            loop.run_until_complete(self._synthesize(text, raw, tts_speed))
+        apply_playback_speed(raw, cached, play_factor)
+        if not cached.exists() or cached.stat().st_size <= 0:
+            raise RuntimeError("本地倍速处理失败")
         return cached
 
     def _estimate_duration_ms(self, path: Path, text: str) -> int:
@@ -1710,7 +1795,7 @@ class NeuralPlayer:
                 return max(300, int(dur * 1000))
         except Exception:
             pass
-        # 按字数粗估（约 4.5 字/秒，再按倍速缩放）
+        # 按字数粗估（约 4.5 字/秒，再按总倍速缩放）
         cps = 4.5 * max(0.5, self._speed)
         return max(600, int(len(text) / cps * 1000))
 
