@@ -28,6 +28,7 @@ import miniaudio
 import pygame
 
 APP_NAME = "听小说"
+APP_VERSION = "1.1.0"
 APP_DIR = Path.home() / ".novel_listener"
 PROGRESS_FILE = APP_DIR / "progress.json"
 SETTINGS_FILE = APP_DIR / "settings.json"
@@ -817,6 +818,7 @@ TTS_MAX_SPEED = 3.0
 SPEED_MIN = 0.5
 SPEED_MAX = 10.0
 SPEED_PRESETS = (1.0, 2.0, 3.0, 5.0, 8.0, 10.0)
+APP_BUILD_LABEL = f"v{APP_VERSION} · 最高{SPEED_MAX:g}x"
 
 
 def clamp_speed(speed: float) -> float:
@@ -1961,7 +1963,7 @@ class App(ctk.CTk):
                 self.theme_name = DEFAULT_THEME
         self.theme = THEMES[self.theme_name]
 
-        self.title(APP_NAME)
+        self.title(f"{APP_NAME}  {APP_BUILD_LABEL}")
         self.geometry("1120x760")
         self.minsize(960, 640)
         self.configure(fg_color=self.theme["bg"])
@@ -2056,9 +2058,9 @@ class App(ctk.CTk):
         )
         ctk.CTkLabel(
             brand,
-            text="真人讲书 · 多本书架",
+            text=f"真人讲书 · 多本书架 · {APP_BUILD_LABEL}",
             font=self.font_small,
-            text_color=self.theme["muted"],
+            text_color=self.theme["accent"],
             anchor="w",
         ).pack(anchor="w", pady=(2, 0))
 
