@@ -2014,6 +2014,7 @@ class App(ctk.CTk):
                 self.speed_value = clamp_speed(float(old_rate) / 180.0)
             else:
                 self.speed_value = 1.0
+        self._speed_apply_job: str | None = None
         self.volume_value = float(settings.get("volume", 1.0))
         self.voice_id = settings.get("voice_id") or DEFAULT_VOICE_KEY
         # 规范化为配置键
@@ -2589,27 +2590,49 @@ class App(ctk.CTk):
             nearest = min(SPEED_PRESETS, key=lambda x: abs(x - self.speed_value))
             self.speed_presets.set(self._preset_label(nearest))
 
-    def _set_speed(self, value: float, restart_hint: bool = True) -> None:
+    def _apply_speed_now(self) -> None:
+        """立刻用新倍速从当前句重新生成并播放。"""
+        self._speed_apply_job = None
+        self.player.configure(self.speed_value, self.voice_id, self.volume_value)
+        self._save_settings_only()
+        if self.playing and not self.paused and self.sentences:
+            self.start_play(from_index=self.sentence_index)
+            self._ui_status(f"已应用 {speed_label(self.speed_value)}")
+        else:
+            self._ui_status(f"速度已设为 {speed_label(self.speed_value)}")
+
+    def _set_speed(self, value: float, apply_now: bool = True, debounce_ms: int = 0) -> None:
         self.speed_value = round(clamp_speed(value), 1)
         self.speed_slider.set(self.speed_value)
         self.speed_label.configure(text=speed_label(self.speed_value))
         self._sync_speed_preset()
         self.player.configure(self.speed_value, self.voice_id, self.volume_value)
         self._save_settings_only()
-        if restart_hint and self.playing and not self.paused:
-            self._ui_status(f"速度已设为 {speed_label(self.speed_value)}（下一句生效）")
+        if not apply_now:
+            return
+        if self._speed_apply_job is not None:
+            try:
+                self.after_cancel(self._speed_apply_job)
+            except Exception:
+                pass
+            self._speed_apply_job = None
+        if debounce_ms > 0:
+            self._speed_apply_job = self.after(debounce_ms, self._apply_speed_now)
+        else:
+            self._apply_speed_now()
 
     def _on_speed(self, value) -> None:
-        self._set_speed(float(value))
+        # 拖动滑条时防抖，松手后立刻按新倍速重开
+        self._set_speed(float(value), apply_now=True, debounce_ms=280)
 
     def _on_speed_preset(self, label: str) -> None:
         try:
-            self._set_speed(float(label.replace("x", "")))
+            self._set_speed(float(label.replace("x", "")), apply_now=True)
         except ValueError:
             pass
 
     def _nudge_speed(self, delta: float) -> None:
-        self._set_speed(self.speed_value + delta)
+        self._set_speed(self.speed_value + delta, apply_now=True)
 
     def _clear_chapter_buttons(self) -> None:
         self._chapter_fill_token += 1  # 取消进行中的分批渲染
