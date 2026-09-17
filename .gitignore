@@ -11,6 +11,10 @@ venv/
 novel_listener/build/
 novel_listener/dist/
 
+# Green-package extracted runtime (generated on first launch)
+听小说应用/runtime/
+听小说应用/_extract_tmp/
+
 # Editor / OS
 .vscode/
 .idea/

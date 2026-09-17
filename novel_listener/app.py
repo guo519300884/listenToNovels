@@ -2589,18 +2589,48 @@ class App(ctk.CTk):
             nearest = min(SPEED_PRESETS, key=lambda x: abs(x - self.speed_value))
             self.speed_presets.set(self._preset_label(nearest))
 
-    def _set_speed(self, value: float, restart_hint: bool = True) -> None:
+    def _set_speed(self, value: float, apply_now: bool = True) -> None:
         self.speed_value = round(clamp_speed(value), 1)
         self.speed_slider.set(self.speed_value)
         self.speed_label.configure(text=speed_label(self.speed_value))
         self._sync_speed_preset()
         self.player.configure(self.speed_value, self.voice_id, self.volume_value)
         self._save_settings_only()
-        if restart_hint and self.playing and not self.paused:
-            self._ui_status(f"速度已设为 {speed_label(self.speed_value)}（下一句生效）")
+        if apply_now:
+            self._apply_speed_now()
+
+    def _apply_speed_now(self) -> None:
+        """播放中改速时立刻从当前句重启，使新倍速马上生效。"""
+        job = getattr(self, "_speed_apply_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+            self._speed_apply_job = None
+
+        if not (self.playing and not self.paused and self.sentences):
+            self._ui_status(f"速度已设为 {speed_label(self.speed_value)}")
+            return
+
+        def _restart() -> None:
+            self._speed_apply_job = None
+            if not (self.playing and not self.paused and self.sentences):
+                return
+            idx = self.sentence_index
+            self.player.stop()
+            self.playing = True
+            self.paused = False
+            self._sync_transport_ui()
+            self.player.configure(self.speed_value, self.voice_id, self.volume_value)
+            self.player.play(self.sentences, idx)
+            self._ui_status(f"速度已设为 {speed_label(self.speed_value)}（已立即应用）")
+
+        # 滑条拖动时合并多次回调，避免每 0.1x 都打断朗读
+        self._speed_apply_job = self.after(280, _restart)
 
     def _on_speed(self, value) -> None:
-        self._set_speed(float(value))
+        self._set_speed(float(value), apply_now=True)
 
     def _on_speed_preset(self, label: str) -> None:
         try:
