@@ -814,11 +814,18 @@ def merge_speech_chunks(sentences: list[str], max_chars: int = 280) -> list[tupl
 
 # Edge TTS rate 实际上限约 +200%（≈3.0x），更高倍速需本地加速补齐
 TTS_MAX_SPEED = 3.0
+SPEED_MIN = 0.5
+SPEED_MAX = 10.0
+SPEED_PRESETS = (1.0, 2.0, 3.0, 5.0, 8.0, 10.0)
+
+
+def clamp_speed(speed: float) -> float:
+    return max(SPEED_MIN, min(SPEED_MAX, float(speed)))
 
 
 def split_speed(speed: float) -> tuple[float, float]:
     """总倍速拆成 Edge TTS 语速 + 本地播放加速因子。"""
-    speed = max(0.5, min(5.0, float(speed)))
+    speed = clamp_speed(speed)
     tts = min(speed, TTS_MAX_SPEED)
     play = speed / tts if tts > 0 else 1.0
     return tts, play
@@ -1656,7 +1663,7 @@ class NeuralPlayer:
         return [(p[0], p[1]) for p in VOICE_PROFILES]
 
     def configure(self, speed: float, voice_key: str | None, volume: float) -> None:
-        self._speed = max(0.5, min(5.0, float(speed)))
+        self._speed = clamp_speed(speed)
         if voice_key:
             key, _name, voice, style, pitch = get_voice_profile(voice_key)
             self._voice_key = key
@@ -1998,13 +2005,13 @@ class App(ctk.CTk):
         self.hotkey_bindings = merge_hotkeys(settings.get("hotkeys"))
         self._play_ui_q: queue.Queue = queue.Queue()
 
-        # 兼容旧版 rate(100-300) 与新版 speed(0.5-5.0)
+        # 兼容旧版 rate(100-300) 与新版 speed(0.5-10.0)
         if "speed" in settings:
-            self.speed_value = max(0.5, min(5.0, float(settings.get("speed", 1.0))))
+            self.speed_value = clamp_speed(settings.get("speed", 1.0))
         else:
             old_rate = settings.get("rate")
             if old_rate is not None:
-                self.speed_value = max(0.5, min(5.0, float(old_rate) / 180.0))
+                self.speed_value = clamp_speed(float(old_rate) / 180.0)
             else:
                 self.speed_value = 1.0
         self.volume_value = float(settings.get("volume", 1.0))
@@ -2392,7 +2399,7 @@ class App(ctk.CTk):
         self.btn_mini.pack(side="left", padx=(12, 4))
 
         self.speed_label = ctk.CTkLabel(
-            dock, text=speed_label(self.speed_value), font=self.font_ui, text_color=self.theme["accent"], width=56, anchor="e"
+            dock, text=speed_label(self.speed_value), font=self.font_ui, text_color=self.theme["accent"], width=64, anchor="e"
         )
         self.speed_label.grid(row=0, column=2, sticky="e", padx=16, pady=14)
 
@@ -2419,11 +2426,11 @@ class App(ctk.CTk):
             text_color=self.theme["text"],
             font=self.font_ui,
         )
-        self.btn_speed_down = ctk.CTkButton(speed_row, text="−", command=lambda: self._nudge_speed(-0.1), **nudge_kw)
+        self.btn_speed_down = ctk.CTkButton(speed_row, text="−", command=lambda: self._nudge_speed(-0.5), **nudge_kw)
         self.btn_speed_down.grid(row=0, column=0, padx=(0, 4))
         self.speed_presets = ctk.CTkSegmentedButton(
             speed_row,
-            values=["1.0x", "1.5x", "2.0x", "3.0x", "5.0x"],
+            values=[f"{s:.0f}x" if s == int(s) else f"{s:.1f}x" for s in SPEED_PRESETS],
             height=28,
             font=self.font_small,
             selected_color=self.theme["seg_selected"],
@@ -2436,9 +2443,9 @@ class App(ctk.CTk):
         self.speed_presets.grid(row=0, column=1, padx=4)
         self.speed_slider = ctk.CTkSlider(
             speed_row,
-            from_=0.5,
-            to=5.0,
-            number_of_steps=45,
+            from_=SPEED_MIN,
+            to=SPEED_MAX,
+            number_of_steps=int(round((SPEED_MAX - SPEED_MIN) / 0.1)),
             progress_color=self.theme["accent"],
             button_color=self.theme["accent"],
             button_hover_color=self.theme["accent_hover"],
@@ -2447,7 +2454,7 @@ class App(ctk.CTk):
         )
         self.speed_slider.set(self.speed_value)
         self.speed_slider.grid(row=0, column=2, sticky="ew", padx=8)
-        self.btn_speed_up = ctk.CTkButton(speed_row, text="+", command=lambda: self._nudge_speed(0.1), **nudge_kw)
+        self.btn_speed_up = ctk.CTkButton(speed_row, text="+", command=lambda: self._nudge_speed(0.5), **nudge_kw)
         self.btn_speed_up.grid(row=0, column=3)
 
         ctk.CTkLabel(settings, text="音量", font=self.font_small, text_color=self.theme["muted"]).grid(
@@ -2570,17 +2577,20 @@ class App(ctk.CTk):
             border_color=self.theme["line"],
         )
 
+    def _preset_label(self, speed: float) -> str:
+        return f"{speed:.0f}x" if float(speed) == int(speed) else f"{speed:.1f}x"
+
     def _sync_speed_preset(self) -> None:
-        key = f"{self.speed_value:.1f}x"
-        presets = ("1.0x", "1.5x", "2.0x", "3.0x", "5.0x")
+        key = self._preset_label(self.speed_value)
+        presets = {self._preset_label(s) for s in SPEED_PRESETS}
         if key in presets:
             self.speed_presets.set(key)
         else:
-            nearest = min([1.0, 1.5, 2.0, 3.0, 5.0], key=lambda x: abs(x - self.speed_value))
-            self.speed_presets.set(f"{nearest:.1f}x")
+            nearest = min(SPEED_PRESETS, key=lambda x: abs(x - self.speed_value))
+            self.speed_presets.set(self._preset_label(nearest))
 
     def _set_speed(self, value: float, restart_hint: bool = True) -> None:
-        self.speed_value = round(max(0.5, min(5.0, float(value))), 1)
+        self.speed_value = round(clamp_speed(value), 1)
         self.speed_slider.set(self.speed_value)
         self.speed_label.configure(text=speed_label(self.speed_value))
         self._sync_speed_preset()
@@ -3659,9 +3669,9 @@ class App(ctk.CTk):
         elif action == "volume_down":
             self._nudge_volume(-0.1)
         elif action == "speed_up":
-            self._nudge_speed(0.1)
+            self._nudge_speed(0.5)
         elif action == "speed_down":
-            self._nudge_speed(-0.1)
+            self._nudge_speed(-0.5)
         elif action == "toggle_mini":
             self.toggle_mini_mode()
 
