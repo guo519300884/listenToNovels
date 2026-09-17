@@ -24,3 +24,7 @@ Desktop.ini
 # Accidental Node leftovers
 node_modules/
 dist-ssr/
+
+# 便携版首次运行解压出的环境（源文件见 发布/听小说便携版_10倍速.zip）
+听小说应用/runtime/
+听小说应用/_extract_tmp/
