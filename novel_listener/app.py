@@ -1,5 +1,5 @@
 ﻿# -*- coding: utf-8 -*-
-"""听小说 — Windows 真人神经网络语音听书应用"""
+"""听小说 — Piper 本地神经网络 + Windows 系统语音 + 微软在线（可选）三后端"""
 
 from __future__ import annotations
 
@@ -12,9 +12,12 @@ import json
 import queue
 import re
 import shutil
+import sys
 import tarfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import wave
 import zipfile
 from ctypes import wintypes
@@ -23,10 +26,51 @@ from tkinter import filedialog, messagebox
 import tkinter as tk
 
 import customtkinter as ctk
-import edge_tts
 import miniaudio
 import numpy as np
 import pygame
+
+try:
+    import edge_tts  # type: ignore
+
+    EDGE_TTS_AVAILABLE = True
+except Exception:
+    edge_tts = None  # type: ignore
+    EDGE_TTS_AVAILABLE = False
+
+
+def _patch_edge_tts_endpoint() -> None:
+    """微软旧 WSS 会 403；切换到 api.msedgeservices.com。"""
+    if not EDGE_TTS_AVAILABLE:
+        return
+    try:
+        import edge_tts.communicate as _comm
+        import edge_tts.constants as _const
+
+        token = _const.TRUSTED_CLIENT_TOKEN
+        base = "api.msedgeservices.com/tts/cognitiveservices"
+        wss = f"wss://{base}/websocket/v1?Ocp-Apim-Subscription-Key={token}"
+        voices = f"https://{base}/voices/list?Ocp-Apim-Subscription-Key={token}"
+        headers = dict(getattr(_const, "WSS_HEADERS", {}))
+        headers["Sec-WebSocket-Protocol"] = "synthesize"
+        _const.BASE_URL = base
+        _const.WSS_URL = wss
+        _const.VOICE_LIST = voices
+        _const.WSS_HEADERS = headers
+        _comm.WSS_URL = wss
+        _comm.WSS_HEADERS = headers
+        try:
+            import edge_tts.voices as _voices
+
+            if hasattr(_voices, "VOICE_LIST"):
+                _voices.VOICE_LIST = voices
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_patch_edge_tts_endpoint()
 
 APP_NAME = "听小说"
 APP_DIR = Path.home() / ".novel_listener"
@@ -34,6 +78,7 @@ PROGRESS_FILE = APP_DIR / "progress.json"
 SETTINGS_FILE = APP_DIR / "settings.json"
 LIBRARY_FILE = APP_DIR / "library.json"
 CACHE_DIR = APP_DIR / "tts_cache"
+VOICES_DIR = APP_DIR / "voices"
 
 NOVEL_FILETYPES = [
     (
@@ -186,33 +231,369 @@ def pick_reader_font(master=None) -> str:
     return "Microsoft YaHei UI"
 
 
-# 真人讲书音色：带讲述风格（mstts express-as），减少机械感
-# (配置键, 显示名, Edge 语音 ID, 风格, 音调)
-VOICE_PROFILES: list[tuple[str, str, str, str | None, str]] = [
-    ("xiaoxiao_relaxed", "晓晓 · 轻松讲书（推荐）", "zh-CN-XiaoxiaoNeural", "narration-relaxed", "-2Hz"),
-    ("xiaoxiao_pro", "晓晓 · 专业讲述", "zh-CN-XiaoxiaoNeural", "narration-professional", "+0Hz"),
-    ("xiaoxiao_lyrical", "晓晓 · 抒情朗读", "zh-CN-XiaoxiaoNeural", "lyrical", "-1Hz"),
-    ("xiaoxiao_gentle", "晓晓 · 温柔细语", "zh-CN-XiaoxiaoNeural", "gentle", "-3Hz"),
-    ("yunyang_pro", "云扬 · 专业播讲", "zh-CN-YunyangNeural", "narration-professional", "-1Hz"),
-    ("yunyang_news", "云扬 · 轻松播报", "zh-CN-YunyangNeural", "newscast-casual", "+0Hz"),
-    ("yunxi_chat", "云希 · 沉稳聊天", "zh-CN-YunxiNeural", "chat", "-2Hz"),
-    ("yunxi_calm", "云希 · 平静讲述", "zh-CN-YunxiNeural", "calm", "-2Hz"),
-    ("xiaoyi", "晓伊 · 自然女声", "zh-CN-XiaoyiNeural", None, "-1Hz"),
-    ("yunjian", "云健 · 自然男声", "zh-CN-YunjianNeural", None, "+0Hz"),
+# 音色：(配置键, 显示名, 后端 piper|sapi|edge, 模型/语音ID, edge音调)
+VOICE_PROFILES: list[tuple[str, str, str, str, str]] = [
+    ("xiaoxiao_relaxed", "晓晓 · 在线轻松讲书（有网推荐）", "edge", "zh-CN-XiaoxiaoNeural", "-2Hz"),
+    ("yunyang_pro", "云扬 · 在线专业播讲", "edge", "zh-CN-YunyangNeural", "-1Hz"),
+    ("yunxi_calm", "云希 · 在线平静讲述", "edge", "zh-CN-YunxiNeural", "-2Hz"),
+    ("xiaoyi", "晓伊 · 在线自然女声", "edge", "zh-CN-XiaoyiNeural", "-1Hz"),
+    ("yunjian", "云健 · 在线自然男声", "edge", "zh-CN-YunjianNeural", "+0Hz"),
+    ("piper_huayan", "华严 · 本地神经网络（无网推荐）", "piper", "zh_CN-huayan-medium", ""),
+    ("sapi_auto", "系统语音 · 免下载离线", "sapi", "auto", ""),
 ]
-DEFAULT_VOICE_KEY = VOICE_PROFILES[0][0]
+ONLINE_DEFAULT_VOICE_KEY = "xiaoxiao_relaxed"
+OFFLINE_DEFAULT_VOICE_KEY = "piper_huayan"
+DEFAULT_VOICE_KEY = ONLINE_DEFAULT_VOICE_KEY
 
 
-def get_voice_profile(key: str | None) -> tuple[str, str, str, str | None, str]:
+def is_network_online(timeout: float = 2.0) -> bool:
+    """快速探测外网（优先微软语音相关域名），用于选择默认语音后端。"""
+    probes = (
+        "https://api.msftconnecttest.com/connecttest.txt",
+        "https://www.msftconnecttest.com/connecttest.txt",
+        "https://speech.platform.bing.com/",
+        "https://www.baidu.com",
+    )
+    for url in probes:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "novel-listener/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if getattr(resp, "status", 200) < 500:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def pick_default_voice_key() -> str:
+    """有网默认微软在线，无网默认 Piper。"""
+    if EDGE_TTS_AVAILABLE and is_network_online():
+        return ONLINE_DEFAULT_VOICE_KEY
+    return OFFLINE_DEFAULT_VOICE_KEY
+
+# 旧版键兼容
+_LEGACY_VOICE_MAP = {
+    "xiaoxiao_pro": "xiaoxiao_relaxed",
+    "xiaoxiao_lyrical": "xiaoxiao_relaxed",
+    "xiaoxiao_gentle": "xiaoxiao_relaxed",
+    "yunyang_news": "yunyang_pro",
+    "yunxi_chat": "yunxi_calm",
+}
+
+# Piper 模型相对路径（HuggingFace rhasspy/piper-voices）
+PIPER_MODEL_FILES: dict[str, tuple[str, str]] = {
+    "zh_CN-huayan-medium": (
+        "zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx",
+        "zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json",
+    ),
+}
+PIPER_MIRRORS = (
+    "https://hf-mirror.com/rhasspy/piper-voices/resolve/v1.0.0/",
+    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/",
+)
+
+_piper_voices: dict[str, object] = {}
+_piper_lock = threading.Lock()
+_sapi_lock = threading.Lock()
+
+
+def get_voice_profile(key: str | None) -> tuple[str, str, str, str, str]:
     if key:
+        key = _LEGACY_VOICE_MAP.get(key, key)
+        if key.startswith("sapi_") and key != "sapi_auto":
+            return (key, "系统语音", "sapi", "auto", "")
         for p in VOICE_PROFILES:
             if p[0] == key:
                 return p
-        # 兼容旧版只存了 voice ShortName
         for p in VOICE_PROFILES:
-            if p[2] == key:
+            if p[3] == key:
                 return p
     return VOICE_PROFILES[0]
+
+
+def _app_bundle_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def voice_search_dirs() -> list[Path]:
+    dirs = [_app_bundle_dir() / "voices", VOICES_DIR]
+    # 去重保序
+    seen: set[str] = set()
+    out: list[Path] = []
+    for d in dirs:
+        k = str(d.resolve()) if d.exists() else str(d)
+        if k not in seen:
+            seen.add(k)
+            out.append(d)
+    return out
+
+
+def find_piper_model(model_id: str) -> Path | None:
+    onnx_name = f"{model_id}.onnx"
+    for d in voice_search_dirs():
+        p = d / onnx_name
+        j = d / f"{model_id}.onnx.json"
+        if p.exists() and p.stat().st_size > 1000 and j.exists():
+            return p
+    return None
+
+
+def ensure_piper_model(model_id: str, on_status=None) -> Path:
+    """确保 Piper 模型在本地；缺失则从镜像下载一次。"""
+    existing = find_piper_model(model_id)
+    if existing is not None:
+        return existing
+    files = PIPER_MODEL_FILES.get(model_id)
+    if not files:
+        raise RuntimeError(f"未知语音模型: {model_id}")
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    rel_onnx, rel_json = files
+    targets = [
+        (rel_onnx, VOICES_DIR / f"{model_id}.onnx"),
+        (rel_json, VOICES_DIR / f"{model_id}.onnx.json"),
+    ]
+    for rel, dest in targets:
+        if dest.exists() and dest.stat().st_size > 100:
+            continue
+        last_err: Exception | None = None
+        for mirror in PIPER_MIRRORS:
+            url = mirror + rel
+            try:
+                if on_status:
+                    on_status(f"首次下载本地语音模型…（仅一次）")
+                tmp = dest.with_suffix(dest.suffix + ".part")
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                req = urllib.request.Request(url, headers={"User-Agent": "novel-listener/1.0"})
+                with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+                if tmp.stat().st_size < 100:
+                    raise RuntimeError("下载文件过小")
+                tmp.replace(dest)
+                last_err = None
+                break
+            except Exception as exc:
+                last_err = exc
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                continue
+        if last_err is not None:
+            raise RuntimeError(
+                f"本地语音模型下载失败，可改用「系统语音」或手动放入：{VOICES_DIR}\n{last_err}"
+            ) from last_err
+    found = find_piper_model(model_id)
+    if found is None:
+        raise RuntimeError("本地语音模型准备失败")
+    return found
+
+
+def load_piper_voice(model_id: str, on_status=None):
+    with _piper_lock:
+        cached = _piper_voices.get(model_id)
+        if cached is not None:
+            return cached
+        from piper import PiperVoice
+
+        path = ensure_piper_model(model_id, on_status=on_status)
+        if on_status:
+            on_status("正在加载本地神经网络音色…")
+        voice = PiperVoice.load(str(path))
+        _piper_voices[model_id] = voice
+        return voice
+
+
+def _prepare_piper_text(text: str) -> str:
+    """整理标点与停顿，让 Piper 中文听感更自然。"""
+    t = (text or "").strip()
+    if not t:
+        return t
+    t = re.sub(r"[ \t]+", " ", t).strip()
+    t = re.sub(r"\n+", "。", t)
+    # 统一中文标点，便于韵律切分
+    repl = {
+        ",": "，",
+        ";": "；",
+        ":": "：",
+        "!": "！",
+        "?": "？",
+        "...": "……",
+        "…": "……",
+    }
+    for a, b in repl.items():
+        t = t.replace(a, b)
+    t = re.sub(r"[，]{2,}", "，", t)
+    t = re.sub(r"[。]{2,}", "。", t)
+    if t[-1] not in "。！？；…」』》":
+        t += "。"
+    return t
+
+
+def synthesize_piper_to_wav(
+    text: str, out_path: Path, model_id: str, tts_speed: float, on_status=None
+) -> None:
+    from piper import SynthesisConfig
+
+    voice = load_piper_voice(model_id, on_status=on_status)
+    speak = _prepare_piper_text(text)
+    # 略放慢基础语速提升清晰度；再按用户倍速缩放（length_scale 越大越慢）
+    base_clarity = 1.12
+    speed = max(0.5, min(float(tts_speed), TTS_MAX_SPEED))
+    length_scale = base_clarity / speed
+    cfg = SynthesisConfig(
+        length_scale=length_scale,
+        noise_scale=0.55,  # 略降噪声，更干净
+        noise_w_scale=0.7,
+        normalize_audio=True,
+        volume=1.0,
+    )
+    tmp = out_path.with_suffix(out_path.suffix + ".partial")
+    try:
+        tmp.unlink(missing_ok=True)
+    except Exception:
+        pass
+    with _piper_lock:
+        with wave.open(str(tmp), "wb") as wf:
+            voice.synthesize_wav(speak, wf, syn_config=cfg)
+    if not tmp.exists() or tmp.stat().st_size <= 44:
+        raise RuntimeError("本地神经网络合成结果为空")
+    tmp.replace(out_path)
+
+
+def list_sapi_chinese_voices() -> list[tuple[str, str]]:
+    """返回 [(token/描述片段, 显示名), ...]。"""
+    try:
+        import win32com.client
+
+        voice = win32com.client.Dispatch("SAPI.SpVoice")
+        out: list[tuple[str, str]] = []
+        for v in voice.GetVoices():
+            desc = str(v.GetDescription())
+            low = desc.lower()
+            if any(
+                k in desc or k in low
+                for k in ("Chinese", "中文", "Huihui", "Yaoyao", "Kangkang", "zh-CN", "Chinese (Simplified)")
+            ):
+                out.append((desc, f"系统 · {desc}"))
+        return out
+    except Exception:
+        return []
+
+
+def speed_to_rate(speed: float) -> str:
+    """Edge TTS rate 字符串。"""
+    pct = int(round((float(speed) - 1.0) * 100))
+    pct = max(-50, min(200, pct))
+    return f"{pct:+d}%"
+
+
+async def synthesize_edge_to_file(
+    text: str,
+    out_path: Path,
+    voice_id: str,
+    tts_speed: float,
+    pitch: str = "+0Hz",
+    on_status=None,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """微软在线神经网络合成（需联网；已打端点补丁；失败自动重试）。"""
+    if not EDGE_TTS_AVAILABLE or edge_tts is None:
+        raise RuntimeError("未安装 edge-tts，无法使用在线音色")
+    rate = speed_to_rate(tts_speed)
+    tmp = out_path.with_suffix(out_path.suffix + ".partial")
+    last_err: BaseException | None = None
+    for attempt in range(1, TTS_EDGE_MAX_RETRIES + 1):
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("stopped")
+        try:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            communicate = edge_tts.Communicate(
+                text,
+                voice=voice_id,
+                rate=rate,
+                pitch=pitch or "+0Hz",
+                connect_timeout=45,
+                receive_timeout=180,
+            )
+            await communicate.save(str(tmp))
+            if not tmp.exists() or tmp.stat().st_size <= 0:
+                raise RuntimeError("在线语音文件为空")
+            tmp.replace(out_path)
+            return
+        except Exception as exc:
+            last_err = exc
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("stopped") from exc
+            if attempt >= TTS_EDGE_MAX_RETRIES:
+                break
+            delay = min(12.0, 0.7 * (2 ** (attempt - 1)))
+            if on_status:
+                try:
+                    on_status(f"在线语音重试 {attempt}/{TTS_EDGE_MAX_RETRIES}…")
+                except Exception:
+                    pass
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"在线语音合成失败: {last_err}") from last_err
+
+
+def synthesize_sapi_to_wav(
+    text: str, out_path: Path, tts_speed: float, voice_match: str = "auto"
+) -> None:
+    """Windows SAPI 离线合成到 WAV（完全不联网）。"""
+    import pythoncom
+    import win32com.client
+
+    pythoncom.CoInitialize()
+    try:
+        with _sapi_lock:
+            voice = win32com.client.Dispatch("SAPI.SpVoice")
+            stream = win32com.client.Dispatch("SAPI.SpFileStream")
+            # SSFMCreateForWrite = 3
+            tmp = out_path.with_suffix(out_path.suffix + ".partial")
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            stream.Open(str(tmp), 3)
+            voice.AudioOutputStream = stream
+            if voice_match and voice_match != "auto":
+                for v in voice.GetVoices():
+                    if voice_match in str(v.GetDescription()):
+                        voice.Voice = v
+                        break
+            else:
+                # 优先中文
+                for v in voice.GetVoices():
+                    desc = str(v.GetDescription())
+                    if any(k in desc for k in ("Chinese", "中文", "Huihui", "Yaoyao", "Kangkang")):
+                        voice.Voice = v
+                        break
+            # SAPI Rate -10..10，约映射 0.5x..2.0x
+            rate = int(round((float(tts_speed) - 1.0) * 10))
+            voice.Rate = max(-10, min(10, rate))
+            voice.Volume = 100
+            voice.Speak(text, 0)  # synchronous
+            stream.Close()
+            if not tmp.exists() or tmp.stat().st_size <= 44:
+                raise RuntimeError("系统语音合成结果为空")
+            tmp.replace(out_path)
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
 
 
 CHAPTER_PATTERNS = [
@@ -981,12 +1362,15 @@ def split_sentences(text: str) -> list[str]:
 
 # 朗读块：偏短更抗弱网（单次请求不易超时），仍保留一定上下文消歧多音字
 SPEECH_CHUNK_CHARS = 200
-TTS_PARALLEL = 2  # 并行合成路数（过大易触发 Bing 限流）
-TTS_PREFETCH = 8  # 预取队列深度（弱网/高倍速时多囤几段）
-TTS_START_BUFFER = 2  # 开播前至少就绪段数，减少开头就断
-TTS_MAX_RETRIES = 10  # 单轮合成最大重试次数（外层还会继续轮询）
-TTS_CONNECT_TIMEOUT = 45  # 连接超时（秒）
-TTS_RECEIVE_TIMEOUT = 180  # 收包超时（秒）
+TTS_PARALLEL_EDGE = 2  # 在线微软：并行预加载（与旧版一致）
+TTS_PARALLEL_LOCAL = 1  # 本地 Piper/SAPI：串行更稳
+TTS_PREFETCH_EDGE = 8  # 在线预取深度
+TTS_PREFETCH_LOCAL = 4
+TTS_START_BUFFER = 2  # 开播前至少就绪段数
+TTS_EDGE_MAX_RETRIES = 8  # 在线段内重试次数（有网不轻易降级）
+# 兼容旧常量引用
+TTS_PARALLEL = TTS_PARALLEL_EDGE
+TTS_PREFETCH = TTS_PREFETCH_EDGE
 
 
 def merge_speech_chunks(sentences: list[str], max_chars: int = SPEECH_CHUNK_CHARS) -> list[tuple[int, int, str]]:
@@ -1148,7 +1532,7 @@ def prepare_tts_text(text: str) -> str:
     return out
 
 
-# Edge TTS rate 实际上限约 +200%（≈3.0x），更高倍速需本地加速补齐
+# 本地 TTS 可直接变速的上限；更高倍速再做本地重采样
 TTS_MAX_SPEED = 3.0
 SPEED_MIN = 0.5
 SPEED_MAX = 10.0
@@ -1160,18 +1544,11 @@ def clamp_speed(speed: float) -> float:
 
 
 def split_speed(speed: float) -> tuple[float, float]:
-    """总倍速拆成 Edge TTS 语速 + 本地播放加速因子。"""
+    """总倍速拆成 TTS 引擎语速 + 本地播放加速因子。"""
     speed = clamp_speed(speed)
     tts = min(speed, TTS_MAX_SPEED)
     play = speed / tts if tts > 0 else 1.0
     return tts, play
-
-
-def speed_to_rate(speed: float) -> str:
-    """把 TTS 倍速转为 edge-tts rate 字符串（建议先经 split_speed）。"""
-    pct = int(round((speed - 1.0) * 100))
-    pct = max(-50, min(200, pct))
-    return f"{pct:+d}%"
 
 
 def speed_label(speed: float) -> str:
@@ -1179,8 +1556,9 @@ def speed_label(speed: float) -> str:
 
 
 def apply_playback_speed(src: Path, dst: Path, factor: float) -> None:
-    """按 factor 加速音频（缩短时长，音调随之升高），写出 24kHz 单声道 WAV。"""
-    if factor <= 1.01:
+    """按 factor 加速音频（缩短时长，音调随之升高），写出 22.05kHz 单声道 WAV。"""
+    # 同格式且不加速时可直接拷贝；mp3→wav 等跨格式必须重编码
+    if factor <= 1.01 and src.suffix.lower() == dst.suffix.lower():
         if src.resolve() != dst.resolve():
             shutil.copy2(src, dst)
         return
@@ -1189,7 +1567,7 @@ def apply_playback_speed(src: Path, dst: Path, factor: float) -> None:
         str(src),
         output_format=miniaudio.SampleFormat.SIGNED16,
         nchannels=1,
-        sample_rate=24000,
+        sample_rate=22050,
     )
     pcm = decoded.samples
     if isinstance(pcm, array.array):
@@ -1214,7 +1592,7 @@ def apply_playback_speed(src: Path, dst: Path, factor: float) -> None:
     with wave.open(str(dst), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(24000)
+        wf.setframerate(22050)
         wf.writeframes(out.tobytes())
 
 
@@ -1980,9 +2358,7 @@ class HotkeySettingsWindow(ctk.CTkToplevel):
 
 
 class NeuralPlayer:
-    """微软 Edge 神经网络真人讲书播放器（讲述风格 + 预加载）。"""
-
-    PREFETCH = TTS_PREFETCH
+    """微软在线 / Piper 本地 / 系统语音三后端播放器（预加载）。"""
 
     def __init__(self, on_status, on_sentence, on_finished):
         self.on_status = on_status
@@ -1995,25 +2371,54 @@ class NeuralPlayer:
         self._producer: threading.Thread | None = None
         self._speed = 1.0
         self._voice_key = DEFAULT_VOICE_KEY
-        self._voice_id = VOICE_PROFILES[0][2]
-        self._style: str | None = VOICE_PROFILES[0][3]
-        self._pitch = VOICE_PROFILES[0][4]
+        self._backend = VOICE_PROFILES[0][2]
+        self._voice_ref = VOICE_PROFILES[0][3]
+        self._pitch = VOICE_PROFILES[0][4] or "+0Hz"
         self._volume = 1.0
         self._mixer_ready = False
         self._temp_files: list[Path] = []
         self._audio_q: queue.Queue | None = None
 
+    @property
+    def PREFETCH(self) -> int:
+        return TTS_PREFETCH_EDGE if self._backend == "edge" else TTS_PREFETCH_LOCAL
+
+    def _parallel(self) -> int:
+        return TTS_PARALLEL_EDGE if self._backend == "edge" else TTS_PARALLEL_LOCAL
+
     def list_voices(self) -> list[tuple[str, str]]:
-        return [(p[0], p[1]) for p in VOICE_PROFILES]
+        items: list[tuple[str, str]] = []
+        for p in VOICE_PROFILES:
+            # 未安装 edge-tts 时隐藏在线音色
+            if p[2] == "edge" and not EDGE_TTS_AVAILABLE:
+                continue
+            items.append((p[0], p[1]))
+        for desc, label in list_sapi_chinese_voices():
+            key = "sapi_" + hashlib.md5(desc.encode("utf-8")).hexdigest()[:10]
+            if not any(k == key for k, _ in items):
+                items.append((key, label))
+        return items
 
     def configure(self, speed: float, voice_key: str | None, volume: float) -> None:
         self._speed = clamp_speed(speed)
         if voice_key:
-            key, _name, voice, style, pitch = get_voice_profile(voice_key)
-            self._voice_key = key
-            self._voice_id = voice
-            self._style = style
-            self._pitch = pitch
+            if voice_key.startswith("sapi_") and voice_key != "sapi_auto":
+                matched = None
+                for desc, _label in list_sapi_chinese_voices():
+                    key = "sapi_" + hashlib.md5(desc.encode("utf-8")).hexdigest()[:10]
+                    if key == voice_key:
+                        matched = desc
+                        break
+                self._voice_key = voice_key
+                self._backend = "sapi"
+                self._voice_ref = matched or "auto"
+                self._pitch = "+0Hz"
+            else:
+                key, _name, backend, ref, pitch = get_voice_profile(voice_key)
+                self._voice_key = key
+                self._backend = backend
+                self._voice_ref = ref
+                self._pitch = pitch or "+0Hz"
         self._volume = max(0.0, min(1.0, float(volume)))
         if self._mixer_ready:
             try:
@@ -2024,27 +2429,25 @@ class NeuralPlayer:
     def _ensure_mixer(self) -> None:
         if not self._mixer_ready:
             # 更大缓冲，减少块切换时的断续
-            pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=8192)
+            pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=8192)
             self._mixer_ready = True
 
     def _cache_path(self, text: str, play_factor: float) -> Path:
-        # v4：多音字消歧后的文本 + TTS/本地加速分开缓存
         tts_speed, _ = split_speed(self._speed)
         key = hashlib.md5(
-            f"v4|{self._voice_key}|{self._pitch}|{speed_to_rate(tts_speed)}|{play_factor:.3f}|{text}".encode(
+            f"v6|{self._backend}|{self._voice_ref}|{self._pitch}|{tts_speed:.3f}|{play_factor:.3f}|{text}".encode(
                 "utf-8"
             )
         ).hexdigest()
-        ext = ".wav" if play_factor > 1.01 else ".mp3"
-        return CACHE_DIR / f"{key}{ext}"
+        return CACHE_DIR / f"{key}.wav"
 
     def _raw_tts_cache_path(self, text: str, tts_speed: float) -> Path:
         key = hashlib.md5(
-            f"v4raw|{self._voice_key}|{self._pitch}|{speed_to_rate(tts_speed)}|{text}".encode(
+            f"v6raw|{self._backend}|{self._voice_ref}|{self._pitch}|{tts_speed:.3f}|{text}".encode(
                 "utf-8"
             )
         ).hexdigest()
-        return CACHE_DIR / f"{key}.mp3"
+        return CACHE_DIR / f"{key}.wav"
 
     def play(self, sentences: list[str], start_index: int = 0) -> None:
         self.stop()
@@ -2107,70 +2510,100 @@ class NeuralPlayer:
                 pass
         self._temp_files.clear()
 
-    @staticmethod
-    def _is_retryable_tts_error(exc: BaseException) -> bool:
-        """弱网下几乎所有合成错误都可重试；仅明确停止/磁盘致命错误时放弃。"""
-        if str(exc) == "stopped":
-            return False
-        msg = str(exc).lower()
-        fatal = ("permission denied", "no space", "read-only", "access is denied")
-        if any(k in msg for k in fatal):
-            return False
-        return True
+    def _synthesize_offline(self, text: str, out_path: Path, tts_speed: float, prefer: str) -> None:
+        """离线合成：piper / sapi。"""
+        if prefer == "piper":
+            model = self._voice_ref if self._backend == "piper" else "zh_CN-huayan-medium"
+            synthesize_piper_to_wav(
+                text, out_path, model, tts_speed, on_status=self.on_status
+            )
+        else:
+            match = self._voice_ref if self._backend == "sapi" else "auto"
+            synthesize_sapi_to_wav(text, out_path, tts_speed, voice_match=match or "auto")
 
     async def _synthesize(self, text: str, out_path: Path, tts_speed: float) -> None:
-        # edge-tts 会自行包装 SSML；只能传纯文本，否则会朗读 XML 标签
-        rate = speed_to_rate(tts_speed)
-        tmp = out_path.with_suffix(out_path.suffix + ".partial")
-        last_err: BaseException | None = None
+        """三后端：edge 在线 / piper 本地 / sapi 系统；失败自动 Piper→系统语音。"""
+        if self._stop.is_set():
+            raise RuntimeError("stopped")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        backend = self._backend
+        ref = self._voice_ref
+        pitch = self._pitch or "+0Hz"
 
-        for attempt in range(1, TTS_MAX_RETRIES + 1):
-            if self._stop.is_set():
-                raise RuntimeError("stopped")
+        async def _edge_to_wav() -> None:
+            tmp_mp3 = out_path.with_suffix(".edge.mp3")
             try:
+                await synthesize_edge_to_file(
+                    text,
+                    tmp_mp3,
+                    ref,
+                    tts_speed,
+                    pitch,
+                    on_status=self.on_status,
+                    stop_event=self._stop,
+                )
+                await asyncio.to_thread(apply_playback_speed, tmp_mp3, out_path, 1.0)
+            finally:
                 try:
-                    tmp.unlink(missing_ok=True)
+                    tmp_mp3.unlink(missing_ok=True)
                 except Exception:
                     pass
-                communicate = edge_tts.Communicate(
-                    text,
-                    voice=self._voice_id,
-                    rate=rate,
-                    pitch=self._pitch,
-                    connect_timeout=TTS_CONNECT_TIMEOUT,
-                    receive_timeout=TTS_RECEIVE_TIMEOUT,
-                )
-                await communicate.save(str(tmp))
-                if not tmp.exists() or tmp.stat().st_size <= 0:
-                    raise RuntimeError("语音文件为空，请检查网络后重试")
-                tmp.replace(out_path)
+
+        if backend == "edge":
+            # 有网时坚持微软在线：段内多次重试，不因偶发失败立刻切 Piper
+            try:
+                await _edge_to_wav()
                 return
             except Exception as exc:
-                last_err = exc
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                if out_path.exists() and out_path.stat().st_size <= 0:
-                    try:
-                        out_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
                 if self._stop.is_set() or str(exc) == "stopped":
                     raise RuntimeError("stopped") from exc
-                if (not self._is_retryable_tts_error(exc)) or attempt >= TTS_MAX_RETRIES:
-                    break
-                # 指数退避，弱网多等一会
-                delay = min(15.0, 0.8 * (2 ** (attempt - 1)))
+                online = await asyncio.to_thread(is_network_online, 2.0)
+                if online:
+                    # 仍判定有网：继续抛出，由外层 prepare_until_ok 再重试在线
+                    raise RuntimeError(f"在线语音暂时失败（将继续重试）: {exc}") from exc
                 try:
-                    self.on_status(f"网络不稳，重试语音 {attempt}/{TTS_MAX_RETRIES}…")
+                    self.on_status("当前无网，临时改用本地神经网络…")
                 except Exception:
                     pass
-                await asyncio.sleep(delay)
+                try:
+                    await asyncio.to_thread(self._synthesize_offline, text, out_path, tts_speed, "piper")
+                    return
+                except Exception:
+                    try:
+                        self.on_status("本地神经网络失败，改用系统语音…")
+                    except Exception:
+                        pass
+                    await asyncio.to_thread(self._synthesize_offline, text, out_path, tts_speed, "sapi")
+                    return
 
-        raise RuntimeError(
-            f"语音合成失败（已重试 {TTS_MAX_RETRIES} 次）: {last_err}"
+        if backend == "piper":
+            try:
+                await asyncio.to_thread(
+                    synthesize_piper_to_wav,
+                    text,
+                    out_path,
+                    ref,
+                    tts_speed,
+                    self.on_status,
+                )
+                return
+            except Exception as exc:
+                if self._stop.is_set():
+                    raise RuntimeError("stopped") from exc
+                try:
+                    self.on_status("本地神经网络不可用，改用系统语音…")
+                except Exception:
+                    pass
+                await asyncio.to_thread(
+                    synthesize_sapi_to_wav, text, out_path, tts_speed, "auto"
+                )
+                return
+
+        await asyncio.to_thread(
+            synthesize_sapi_to_wav, text, out_path, tts_speed, ref or "auto"
         )
+        if not out_path.exists() or out_path.stat().st_size <= 44:
+            raise RuntimeError("语音文件为空")
 
     async def _prepare_audio_async(self, text: str) -> Path:
         speak = prepare_tts_text(text)
@@ -2183,11 +2616,10 @@ class NeuralPlayer:
             await self._synthesize(speak, cached, tts_speed)
             return cached
 
-        # >3x：先按 TTS 上限合成，再本地加速到目标倍速
+        # 超高倍速：先按 TTS 上限合成，再本地加速
         raw = self._raw_tts_cache_path(speak, tts_speed)
         if not (raw.exists() and raw.stat().st_size > 0):
             await self._synthesize(speak, raw, tts_speed)
-        # 本地重采样放到线程池，避免阻塞事件循环
         await asyncio.to_thread(apply_playback_speed, raw, cached, play_factor)
         if not cached.exists() or cached.stat().st_size <= 0:
             raise RuntimeError("本地倍速处理失败")
@@ -2198,8 +2630,20 @@ class NeuralPlayer:
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._producer_async(chunks, audio_q))
+        except Exception as exc:
+            try:
+                self.on_status(f"语音任务异常: {str(exc)[:80]}")
+            except Exception:
+                pass
+            try:
+                audio_q.put(None)
+            except Exception:
+                pass
         finally:
-            loop.close()
+            try:
+                loop.close()
+            except Exception:
+                pass
 
     async def _producer_async(
         self, chunks: list[tuple[int, int, str]], audio_q: queue.Queue
@@ -2212,8 +2656,15 @@ class NeuralPlayer:
         next_submit = 0
         next_emit = 0
         in_flight: dict[int, asyncio.Task] = {}
-        # 高倍速播得快，多囤几段；弱网时队列也更深
-        ahead = max(TTS_PARALLEL, min(self.PREFETCH, 2 + int(self._speed)))
+        parallel = self._parallel()
+        prefetch = self.PREFETCH
+        # 在线微软：并行预取；本地：串行。高倍速再多囤几段
+        ahead = max(parallel, min(prefetch, 2 + int(self._speed)))
+        if self._backend == "edge":
+            try:
+                self.on_status(f"在线预加载中（并行{parallel}/预取{prefetch}）…")
+            except Exception:
+                pass
 
         async def prepare_until_ok(text: str) -> Path | None:
             """当前段必须成功；失败退避重试，绝不跳过。"""
@@ -2226,10 +2677,9 @@ class NeuralPlayer:
                         return None
                     round_n += 1
                     delay = min(16.0, 1.0 * (1.6 ** min(round_n - 1, 7)))
+                    tip = "在线语音" if self._backend == "edge" else "语音合成"
                     try:
-                        self.on_status(
-                            f"弱网重试中（第 {round_n} 轮）…稍后自动续播"
-                        )
+                        self.on_status(f"{tip}重试第 {round_n} 轮…（保持当前音色）")
                     except Exception:
                         pass
                     await asyncio.sleep(delay)
@@ -2246,7 +2696,7 @@ class NeuralPlayer:
             while (
                 next_submit < len(chunks)
                 and next_submit < next_emit + ahead
-                and len(in_flight) < TTS_PARALLEL
+                and len(in_flight) < parallel
                 and not self._stop.is_set()
             ):
                 _a, _b, text = chunks[next_submit]
@@ -2337,8 +2787,9 @@ class NeuralPlayer:
             (start_index + a, start_index + b, text) for a, b, text in raw_chunks
         ]
 
-        # 高倍速时加深队列，降低弱网抽干缓冲的概率
-        qsize = min(16, max(self.PREFETCH, self.PREFETCH + int(self._speed)))
+        # 在线预取更深；高倍速再加深，避免缓冲被抽干
+        pref = self.PREFETCH
+        qsize = min(16, max(pref, pref + int(self._speed)))
         audio_q: queue.Queue = queue.Queue(maxsize=qsize)
         self._audio_q = audio_q
         self.on_status("预加载语音中…")
@@ -2376,7 +2827,7 @@ class NeuralPlayer:
                         finished_naturally = not self._stop.is_set()
                     break
                 if isinstance(item, tuple) and item and item[0] == "error":
-                    self.on_status(f"语音生成失败（需联网）: {str(item[1])[:80]}")
+                    self.on_status(f"语音生成失败: {str(item[1])[:80]}")
                     return
                 pending.append(item)
                 self.on_status(f"预加载语音中… {len(pending)}/{start_need}")
@@ -2394,13 +2845,13 @@ class NeuralPlayer:
                             underrun_since = None
                         except queue.Empty:
                             if primed:
-                                self.on_status("网络中断，点播放可从当前位置继续")
+                                self.on_status("朗读中断，点播放可从当前位置继续")
                             break
                     else:
                         if primed:
                             if underrun_since is None:
                                 underrun_since = time.time()
-                            self.on_status("弱网缓冲中，稍后自动续播…")
+                            self.on_status("语音缓冲中，稍后自动续播…")
                         else:
                             self.on_status("预加载语音中…")
                         continue
@@ -2410,11 +2861,7 @@ class NeuralPlayer:
                     break
                 if isinstance(item, tuple) and item and item[0] == "error":
                     err = str(item[1] if len(item) > 1 else "未知错误")
-                    if "timeout" in err.lower() or "connection" in err.lower():
-                        self.on_status("网络超时，正在自动恢复…可稍候或检查网络")
-                    else:
-                        self.on_status(f"语音生成失败（需联网）: {err[:80]}")
-                    # 不直接结束全书：若队列里还有已合成段则继续
+                    self.on_status(f"语音生成失败: {err[:80]}")
                     continue
                 if len(item) == 5:
                     start_i, end_i, text, path, duration_ms = item
@@ -2575,9 +3022,12 @@ class App(ctk.CTk):
                 self.speed_value = 1.0
         self._speed_apply_job: str | None = None
         self.volume_value = float(settings.get("volume", 1.0))
-        self.voice_id = settings.get("voice_id") or DEFAULT_VOICE_KEY
-        # 规范化为配置键
-        self.voice_id = get_voice_profile(self.voice_id)[0]
+        # 未手动选过音色：有网默认微软在线，无网默认 Piper
+        self._voice_user_set = bool(settings.get("voice_user_set"))
+        if self._voice_user_set and settings.get("voice_id"):
+            self.voice_id = get_voice_profile(settings.get("voice_id"))[0]
+        else:
+            self.voice_id = pick_default_voice_key()
 
         self.player = NeuralPlayer(
             on_status=self._ui_status,
@@ -2586,7 +3036,9 @@ class App(ctk.CTk):
         )
         self.voices = self.player.list_voices()
         if not any(vid == self.voice_id for vid, _ in self.voices):
-            self.voice_id = self.voices[0][0]
+            self.voice_id = pick_default_voice_key()
+            if not any(vid == self.voice_id for vid, _ in self.voices):
+                self.voice_id = self.voices[0][0]
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2641,7 +3093,7 @@ class App(ctk.CTk):
         ).pack(anchor="w")
         ctk.CTkLabel(
             brand_text,
-            text="真人讲书 · 高清夜读",
+            text="本地讲书 · 离线畅听",
             font=self.font_small,
             text_color=self.theme["accent"],
             anchor="w",
@@ -2874,7 +3326,7 @@ class App(ctk.CTk):
             "把喜欢的小说放进书架，像坐进夜间书房一样慢慢听。\n\n"
             "1. 左侧导入小说或文件夹（支持 zip / 7z）\n"
             "2. 在书架选书，在目录跳章\n"
-            "3. 选好讲书音色，点播放\n\n"
+            "3. 选好本地音色，点播放（无需联网）\n\n"
             "单击正文可从该处开听；朗读时句子会高亮跟随。"
         )
         self._setup_reader_readonly()
@@ -3079,7 +3531,7 @@ class App(ctk.CTk):
         )
         self.vol_label.grid(row=0, column=1, padx=(6, 0))
 
-        ctk.CTkLabel(settings, text="讲书音色", font=self.font_small, text_color=self.theme["muted"]).grid(
+        ctk.CTkLabel(settings, text="本地音色", font=self.font_small, text_color=self.theme["muted"]).grid(
             row=0, column=4, padx=(12, 6), pady=(14, 4), sticky="w"
         )
         voice_names = [name for _, name in self.voices]
@@ -4192,11 +4644,38 @@ class App(ctk.CTk):
             messagebox.showinfo(APP_NAME, "当前章节没有可朗读的内容。")
             return
         idx = self.sentence_index if from_index is None else from_index
+        # 未手动指定：有网锁微软在线，无网才用 Piper；探测抖动时也优先保持在线音色
+        if not self._voice_user_set:
+            cur_backend = get_voice_profile(self.voice_id)[2]
+            online = is_network_online(2.0)
+            if online and EDGE_TTS_AVAILABLE:
+                key = ONLINE_DEFAULT_VOICE_KEY
+            else:
+                key = OFFLINE_DEFAULT_VOICE_KEY
+            # 已在用在线音色且仍有网：不要切走
+            if cur_backend == "edge" and online:
+                key = self.voice_id if get_voice_profile(self.voice_id)[2] == "edge" else ONLINE_DEFAULT_VOICE_KEY
+            if key != self.voice_id and any(vid == key for vid, _ in self.voices):
+                self.voice_id = key
+                if hasattr(self, "voice_menu"):
+                    name = next((n for v, n in self.voices if v == key), None)
+                    if name:
+                        try:
+                            self.voice_menu.set(name)
+                        except Exception:
+                            pass
         self.playing = True
         self.paused = False
         self._sync_transport_ui()
-        self.player.configure(self.speed_value, self.voice_id, self.volume_value)
-        self.player.play(self.sentences, idx)
+        try:
+            self.player.configure(self.speed_value, self.voice_id, self.volume_value)
+            self.player.play(self.sentences, idx)
+        except Exception as exc:
+            self.playing = False
+            self.paused = False
+            self._sync_transport_ui()
+            self._ui_status(f"无法开始播放: {str(exc)[:80]}")
+            messagebox.showerror(APP_NAME, f"无法开始播放：\n{exc}")
 
     def toggle_play(self) -> None:
         if not self.chapters:
@@ -4369,12 +4848,15 @@ class App(ctk.CTk):
             if vname == name:
                 self.voice_id = vid
                 break
+        self._voice_user_set = True
         self.player.configure(self.speed_value, self.voice_id, self.volume_value)
         self._save_settings_only()
+        backend = get_voice_profile(self.voice_id)[2]
+        tip = {"edge": "在线", "piper": "本地神经网络", "sapi": "系统"}.get(backend, "")
         if self.playing:
-            self._ui_status("讲书音色已切换（下一段生效，更接近真人播讲）")
+            self._ui_status(f"音色已切换为{tip}（下一段生效）")
         else:
-            self._ui_status("已选择真人讲书音色")
+            self._ui_status(f"已选择{tip}音色")
 
     def _ui_status(self, text: str) -> None:
         # 播放线程只投递队列，由主线程轮询更新（tk 非线程安全）
@@ -4854,6 +5336,7 @@ class App(ctk.CTk):
                 "speed": self.speed_value,
                 "volume": self.volume_value,
                 "voice_id": self.voice_id,
+                "voice_user_set": bool(getattr(self, "_voice_user_set", False)),
                 "theme": self.theme_name,
                 "hotkeys": self.hotkey_bindings,
             },
