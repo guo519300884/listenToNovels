@@ -25,6 +25,7 @@ import tkinter as tk
 import customtkinter as ctk
 import edge_tts
 import miniaudio
+import numpy as np
 import pygame
 
 APP_NAME = "听小说"
@@ -73,83 +74,116 @@ MAX_FOLDER_SCAN = 3000  # 文件夹扫描上限
 MAX_NOVEL_OPEN_WARN_BYTES = 200 * 1024 * 1024  # 打开单本超过 200MB 再提示
 IMPORT_EXTRACT_DIR = APP_DIR / "imports"
 
-# 日间 / 夜间 两套主题（保证文字与背景对比清晰）
+# 日间 / 夜间：夜间摸鱼（低亮度、低饱和）/ 日间素纸（柔和米纸）
 THEMES: dict[str, dict[str, str]] = {
     "夜间": {
-        "bg": "#0f0f0f",
-        "sidebar": "#171717",
-        "panel": "#1e1e1e",
-        "panel_soft": "#2a2a2a",
-        "reader": "#141414",
-        "text": "#f5f5f5",
-        "muted": "#b8b8b8",
-        "faint": "#8c8c8c",
-        "line": "#404040",
-        "accent": "#5ecf8f",
-        "accent_hover": "#76db9f",
-        "accent_dim": "#1e3d2c",
-        "on_accent": "#0a0a0a",
-        "play": "#3d9b6e",
-        "play_hover": "#4db580",
-        "stop": "#d15a4e",
-        "stop_hover": "#e06b5f",
-        "chip": "#303030",
-        "chip_hover": "#3c3c3c",
-        "hit": "#4a4228",
-        "hit_fg": "#ffe9b0",
-        "hit_cur": "#e8b84a",
-        "hit_cur_fg": "#1a1200",
-        "speak": "#1b7a4a",
-        "speak_fg": "#ffffff",
-        "seg_text": "#ffffff",
-        "seg_selected": "#3d9b6e",
-        "seg_selected_hover": "#4db580",
-        "seg_unselected": "#2a2a2a",
-        "seg_unselected_hover": "#383838",
-        "entry_bg": "#252525",
-        "badge_idle": "#3a3a3a",
-        "badge_idle_text": "#d0d0d0",
+        # 整体压暗：远处同学瞟一眼像普通深色窗口
+        "bg": "#0c0c0c",
+        "sidebar": "#111111",
+        "panel": "#161616",
+        "panel_soft": "#1e1e1e",
+        "reader": "#101010",
+        "text": "#c8c8c8",
+        "muted": "#8a8a8a",
+        "faint": "#5c5c5c",
+        "line": "#2a2a2a",
+        # 强调色：灰绿，不刺眼
+        "accent": "#6a8f73",
+        "accent_hover": "#7fa088",
+        "accent_dim": "#1a2420",
+        "on_accent": "#0e100e",
+        "play": "#5f7f68",
+        "play_hover": "#71947a",
+        "stop": "#8a5a55",
+        "stop_hover": "#9a6a65",
+        "chip": "#222222",
+        "chip_hover": "#2c2c2c",
+        "hit": "#2a2a22",
+        "hit_fg": "#b8b090",
+        "hit_cur": "#4a5a48",
+        "hit_cur_fg": "#d0d0c8",
+        # 朗读高亮：暗底微亮，不发光
+        "speak": "#2a3830",
+        "speak_fg": "#d0d8d2",
+        "seg_text": "#c8c8c8",
+        "seg_selected": "#3d4f42",
+        "seg_selected_hover": "#4a5c4e",
+        "seg_unselected": "#1e1e1e",
+        "seg_unselected_hover": "#282828",
+        "entry_bg": "#141414",
+        "badge_idle": "#242424",
+        "badge_idle_text": "#9a9a9a",
+        "rail": "#3d4f42",
         "mode": "dark",
     },
     "日间": {
-        "bg": "#eef0f2",
-        "sidebar": "#e4e7eb",
-        "panel": "#ffffff",
-        "panel_soft": "#f3f4f6",
-        "reader": "#ffffff",
-        "text": "#111827",
-        "muted": "#4b5563",
-        "faint": "#6b7280",
-        "line": "#c5cad3",
-        "accent": "#15803d",
-        "accent_hover": "#166534",
-        "accent_dim": "#dcfce7",
-        "on_accent": "#ffffff",
-        "play": "#16a34a",
-        "play_hover": "#15803d",
-        "stop": "#dc2626",
-        "stop_hover": "#b91c1c",
-        "chip": "#e5e7eb",
-        "chip_hover": "#d1d5db",
-        "hit": "#fef3c7",
-        "hit_fg": "#78350f",
-        "hit_cur": "#f59e0b",
-        "hit_cur_fg": "#1c1917",
-        "speak": "#86efac",
-        "speak_fg": "#14532d",
-        "seg_text": "#111827",
-        "seg_selected": "#86efac",
-        "seg_selected_hover": "#4ade80",
-        "seg_unselected": "#e5e7eb",
-        "seg_unselected_hover": "#d1d5db",
-        "entry_bg": "#ffffff",
-        "badge_idle": "#d1d5db",
-        "badge_idle_text": "#374151",
+        # 日间也压一点饱和，别太白晃眼
+        "bg": "#e8e4dc",
+        "sidebar": "#ddd7cc",
+        "panel": "#f3efe6",
+        "panel_soft": "#e8e2d6",
+        "reader": "#f7f3ea",
+        "text": "#3a342c",
+        "muted": "#6e6458",
+        "faint": "#8a8074",
+        "line": "#cfc6b8",
+        "accent": "#6b7a62",
+        "accent_hover": "#5a6952",
+        "accent_dim": "#dde4d8",
+        "on_accent": "#f7f3ea",
+        "play": "#6b7a62",
+        "play_hover": "#5a6952",
+        "stop": "#9a6a62",
+        "stop_hover": "#8a5a52",
+        "chip": "#ddd6c8",
+        "chip_hover": "#d0c8ba",
+        "hit": "#ebe4d4",
+        "hit_fg": "#5a5040",
+        "hit_cur": "#8a9a7e",
+        "hit_cur_fg": "#243020",
+        "speak": "#d8e0d4",
+        "speak_fg": "#2e342c",
+        "seg_text": "#3a342c",
+        "seg_selected": "#8a9a7e",
+        "seg_selected_hover": "#7a8a6e",
+        "seg_unselected": "#e4ddd0",
+        "seg_unselected_hover": "#d8d0c2",
+        "entry_bg": "#f7f3ea",
+        "badge_idle": "#d4cdc0",
+        "badge_idle_text": "#5a5040",
+        "rail": "#6b7a62",
         "mode": "light",
     },
 }
 DEFAULT_THEME = "夜间"
 THEME_NAMES = ["夜间", "日间"]
+
+
+def pick_ui_font() -> str:
+    return "Microsoft YaHei UI"
+
+
+def pick_reader_font(master=None) -> str:
+    """正文优先楷体，更有书卷气；找不到再回退雅黑。"""
+    try:
+        from tkinter import font as tkfont
+        import tkinter as _tk
+
+        root = master or getattr(_tk, "_default_root", None)
+        created = False
+        if root is None:
+            root = _tk.Tk()
+            root.withdraw()
+            created = True
+        families = set(tkfont.families(root))
+        if created:
+            root.destroy()
+        for name in ("华文楷体", "STKaiti", "楷体", "KaiTi", "等线", "Microsoft YaHei UI"):
+            if name in families:
+                return name
+    except Exception:
+        pass
+    return "Microsoft YaHei UI"
 
 
 # 真人讲书音色：带讲述风格（mstts express-as），减少机械感
@@ -225,7 +259,12 @@ def ensure_app_dir() -> None:
 def load_json(path: Path, default):
     try:
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+            raw = path.read_bytes()
+            for enc in ("utf-8-sig", "utf-8", "gb18030"):
+                try:
+                    return json.loads(raw.decode(enc))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
     except Exception:
         pass
     return default
@@ -234,6 +273,116 @@ def load_json(path: Path, default):
 def save_json(path: Path, data) -> None:
     ensure_app_dir()
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _configure_app_encoding() -> None:
+    """避免 Windows / 打包环境下中文界面与路径乱码。"""
+    import os
+    import sys
+
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        # 控制台代码页 65001，减少子进程/日志乱码
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
+
+
+def decode_zip_member_name(info: zipfile.ZipInfo) -> str:
+    """修复中文 zip 文件名被按 cp437 解出来的乱码。"""
+    name = info.filename
+    # bit 11：文件名是 UTF-8
+    if info.flag_bits & 0x800:
+        return name
+    try:
+        return name.encode("cp437").decode("gb18030")
+    except Exception:
+        try:
+            return name.encode("cp437").decode("gbk")
+        except Exception:
+            return name
+
+
+def _text_encoding_score(text: str) -> float:
+    """给解码结果打分：汉字多、替换符/怪异字符少则更可信。"""
+    if not text:
+        return -1.0
+    sample = text[:12000]
+    n = max(len(sample), 1)
+    cjk = sum(1 for c in sample if "\u4e00" <= c <= "\u9fff")
+    fffd = sample.count("\ufffd")
+    # GBK 被误读成 latin1/符号时，常见高位拉丁字母与特殊框线
+    weird_latin = sum(1 for c in sample if "\u00c0" <= c <= "\u024f")
+    box = sum(1 for c in sample if "\u2500" <= c <= "\u257f")
+    nul = sample.count("\x00")
+    return cjk * 3.0 - fffd * 80.0 - weird_latin * 1.5 - box * 2.0 - nul * 100.0 - (0.01 * n)
+
+
+def sanitize_novel_text(text: str) -> str:
+    """去掉会弄坏 Tk 文本控件显示的控制字符。"""
+    if not text:
+        return ""
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if ch in "\n\t\r":
+            out.append("\n" if ch == "\r" else ch)
+        elif o == 0x00 or o == 0xFEFF:
+            continue
+        elif o < 32:
+            continue
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def resolve_existing_novel_path(path: Path) -> Path:
+    """书架路径失效时，按文件名在常见目录里自动找回。"""
+    path = Path(path)
+    try:
+        if path.exists():
+            return path
+    except Exception:
+        pass
+    name = path.name
+    if not name:
+        return path
+    candidates = [
+        path.parent,
+        Path(r"D:\乱七八糟书"),
+        Path(r"D:\迅雷下载"),
+        Path.home() / "Downloads",
+        Path.home() / "Desktop",
+        IMPORT_EXTRACT_DIR,
+    ]
+    seen: set[str] = set()
+    for folder in candidates:
+        try:
+            folder = Path(folder)
+            key = str(folder).lower()
+            if key in seen or not folder.is_dir():
+                continue
+            seen.add(key)
+            hit = folder / name
+            if hit.exists():
+                return hit
+            # 宽松：同目录下 stem 完全相同
+            stem = Path(name).stem
+            for p in folder.glob("*"):
+                if p.is_file() and p.stem == stem and p.suffix.lower() in NOVEL_SUFFIXES:
+                    return p
+        except Exception:
+            continue
+    return path
 
 
 def book_id_for_path(path: Path) -> str:
@@ -326,7 +475,8 @@ def extract_archive_to(archive: Path, dest: Path) -> None:
             for info in zf.infolist():
                 if info.is_dir():
                     continue
-                target = _safe_join(dest, info.filename)
+                member_name = decode_zip_member_name(info)
+                target = _safe_join(dest, member_name)
                 if target is None:
                     continue
                 # 优先解压可能是小说的文件，其它也解出来以便嵌套判断
@@ -489,22 +639,36 @@ def load_library() -> dict:
         books = []
     cleaned = []
     seen = set()
+    changed = False
     for item in books:
         if not isinstance(item, dict):
             continue
         p = str(item.get("path") or "").strip()
         if not p:
             continue
-        path = Path(p)
+        path = resolve_existing_novel_path(Path(p))
+        if str(path) != p:
+            changed = True
         bid = str(item.get("id") or book_id_for_path(path))
         if bid in seen:
             continue
         seen.add(bid)
+        title = str(item.get("title") or "").strip()
+        # 标题含替换符或为空时，用当前文件名重建，避免书架乱码
+        if (not title) or ("\ufffd" in title) or ("�" in title):
+            title = novel_display_title(path)
+            changed = True
+        elif path.exists():
+            # 路径已找回时，同步为磁盘上的正确文件名
+            disk_title = novel_display_title(path)
+            if disk_title and title != disk_title and Path(p).name != path.name:
+                title = disk_title
+                changed = True
         cleaned.append(
             {
                 "id": bid,
                 "path": str(path),
-                "title": str(item.get("title") or novel_display_title(path)),
+                "title": title or novel_display_title(path),
                 "added_at": float(item.get("added_at") or time.time()),
                 "chapter_count": int(item.get("chapter_count") or 0),
                 "char_count": int(item.get("char_count") or 0),
@@ -512,6 +676,11 @@ def load_library() -> dict:
         )
     data["books"] = cleaned
     data["current_id"] = data.get("current_id")
+    if changed:
+        try:
+            save_library(data)
+        except Exception:
+            pass
     return data
 
 
@@ -520,18 +689,43 @@ def save_library(data: dict) -> None:
 
 
 def read_text_file(path: Path) -> str:
+    """智能识别编码，避免 GBK/UTF-8 小说正文乱码。"""
     raw = path.read_bytes()
+    if not raw:
+        return ""
+    # UTF-16 BOM
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        try:
+            return sanitize_novel_text(raw.decode("utf-16"))
+        except UnicodeDecodeError:
+            pass
+
+    candidates: list[tuple[float, str, str]] = []
     for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5"):
         try:
-            return raw.decode(enc)
+            text = raw.decode(enc)
         except UnicodeDecodeError:
             continue
-    return raw.decode("utf-8", errors="replace")
+        score = _text_encoding_score(text)
+        candidates.append((score, enc, text))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return sanitize_novel_text(candidates[0][2])
+
+    # 最后兜底：替换无法解码字节，并再与 gb18030 replace 比分
+    utf_fallback = raw.decode("utf-8", errors="replace")
+    gb_fallback = raw.decode("gb18030", errors="replace")
+    best = utf_fallback
+    if _text_encoding_score(gb_fallback) > _text_encoding_score(utf_fallback):
+        best = gb_fallback
+    return sanitize_novel_text(best)
 
 
 def _normalize_extracted_text(text: str) -> str:
     if not text:
         return ""
+    text = sanitize_novel_text(text)
     # 大文件避免多次全量正则；先统一换行再做轻量压缩
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     if len(text) > 800_000:
@@ -785,7 +979,17 @@ def split_sentences(text: str) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
-def merge_speech_chunks(sentences: list[str], max_chars: int = 280) -> list[tuple[int, int, str]]:
+# 朗读块：偏短更抗弱网（单次请求不易超时），仍保留一定上下文消歧多音字
+SPEECH_CHUNK_CHARS = 200
+TTS_PARALLEL = 2  # 并行合成路数（过大易触发 Bing 限流）
+TTS_PREFETCH = 8  # 预取队列深度（弱网/高倍速时多囤几段）
+TTS_START_BUFFER = 2  # 开播前至少就绪段数，减少开头就断
+TTS_MAX_RETRIES = 10  # 单轮合成最大重试次数（外层还会继续轮询）
+TTS_CONNECT_TIMEOUT = 45  # 连接超时（秒）
+TTS_RECEIVE_TIMEOUT = 180  # 收包超时（秒）
+
+
+def merge_speech_chunks(sentences: list[str], max_chars: int = SPEECH_CHUNK_CHARS) -> list[tuple[int, int, str]]:
     """把短句合并成朗读块，减少联网合成次数，听感更连贯。
     返回 (起始句下标, 结束句下标, 合并文本)。
     """
@@ -810,6 +1014,138 @@ def merge_speech_chunks(sentences: list[str], max_chars: int = 280) -> list[tupl
     if buf:
         chunks.append((start, start + len(buf) - 1, "".join(buf)))
     return chunks
+
+
+# 多音字：按「长词优先」的上下文规则改写送入 TTS 的文本（正文显示不变）
+# 用更稳的同义/近义说法引导神经网络读音，避免短句里读错。
+_POLYPHONE_RULES: list[tuple[re.Pattern[str], str]] = [
+    # 还 huán（归还）
+    (re.compile(r"还给"), "交还给"),
+    (re.compile(r"还回"), "交还"),
+    (re.compile(r"还([钱债款贷物])"), r"偿还\1"),
+    (re.compile(r"偿还"), "偿还"),
+    (re.compile(r"归还"), "归还"),
+    # 还 hái（仍然）——常见搭配保持原样即可，显式保护
+    (re.compile(r"还(是|有|在|没|未|要|能|会|得|可以|行|好|早|晚)"), r"还\1"),
+    # 行 háng / xíng
+    (re.compile(r"银行"), "银行"),
+    (re.compile(r"行列"), "行列"),
+    (re.compile(r"行情"), "行情"),
+    (re.compile(r"行业"), "行业"),
+    (re.compile(r"行号"), "行号"),
+    (re.compile(r"内行"), "内行"),
+    (re.compile(r"外行"), "外行"),
+    (re.compile(r"道行"), "道行"),
+    (re.compile(r"行走"), "行走"),
+    (re.compile(r"行李"), "行李"),
+    (re.compile(r"行程"), "行程"),
+    (re.compile(r"行人"), "行人"),
+    (re.compile(r"行动"), "行动"),
+    (re.compile(r"不行"), "不行"),
+    (re.compile(r"行啊"), "行啊"),
+    (re.compile(r"行吧"), "行吧"),
+    # 长 cháng / zhǎng
+    (re.compile(r"长度"), "长度"),
+    (re.compile(r"长短"), "长短"),
+    (re.compile(r"长安"), "长安"),
+    (re.compile(r"长江"), "长江"),
+    (re.compile(r"长城"), "长城"),
+    (re.compile(r"长期"), "长期"),
+    (re.compile(r"专长"), "专长"),
+    (re.compile(r"特长"), "特长"),
+    (re.compile(r"长大"), "长大"),
+    (re.compile(r"长辈"), "长辈"),
+    (re.compile(r"长老"), "长老"),
+    (re.compile(r"校长"), "校长"),
+    (re.compile(r"队长"), "队长"),
+    (re.compile(r"组长"), "组长"),
+    (re.compile(r"成长"), "成长"),
+    (re.compile(r"长高"), "长高"),
+    (re.compile(r"长胖"), "长胖"),
+    # 重 zhòng / chóng
+    (re.compile(r"重要"), "重要"),
+    (re.compile(r"重量"), "重量"),
+    (re.compile(r"沉重"), "沉重"),
+    (re.compile(r"尊重"), "尊重"),
+    (re.compile(r"重新"), "重新"),
+    (re.compile(r"重复"), "重复"),
+    (re.compile(r"重来"), "重来"),
+    (re.compile(r"重逢"), "重逢"),
+    # 得 dé / de / děi
+    (re.compile(r"得到"), "得到"),
+    (re.compile(r"获得"), "获得"),
+    (re.compile(r"得意"), "得意"),
+    (re.compile(r"觉得"), "觉得"),
+    (re.compile(r"记得"), "记得"),
+    (re.compile(r"认得"), "认得"),
+    (re.compile(r"得亏"), "得亏"),
+    # 「得」作 děi（必须）：限定人称/句首，避免误伤「跑得快」这类结构助词
+    (re.compile(r"(我|你|他|她|它|我们|你们|他们|她们|咱|咱们)得(走|去|来|回|先|马上|立刻|赶紧)"), r"\1必须\2"),
+    (re.compile(r"(?<=[，。！？；、\n])得(走|去|来|回|先|马上|立刻|赶紧)"), r"必须\1"),
+    (re.compile(r"^得(走|去|来|回|先|马上|立刻|赶紧)"), r"必须\1"),
+    # 地 dì / de
+    (re.compile(r"天地"), "天地"),
+    (re.compile(r"大地"), "大地"),
+    (re.compile(r"土地"), "土地"),
+    (re.compile(r"地点"), "地点"),
+    (re.compile(r"地位"), "地位"),
+    (re.compile(r"地板"), "地板"),
+    (re.compile(r"地下"), "地下"),
+    # 着 zhe / zháo / zhuó
+    (re.compile(r"着急"), "着急"),
+    (re.compile(r"着凉"), "着凉"),
+    (re.compile(r"着火"), "着火"),
+    (re.compile(r"沉着"), "沉着"),
+    (re.compile(r"着装"), "着装"),
+    (re.compile(r"着陆"), "着陆"),
+    (re.compile(r"顺着"), "顺着"),
+    (re.compile(r"沿着"), "沿着"),
+    (re.compile(r"接着"), "接着"),
+    (re.compile(r"意味着"), "意味着"),
+    # 其它小说高频易错
+    (re.compile(r"说服"), "说服"),
+    (re.compile(r"骨头"), "骨头"),
+    (re.compile(r"便宜"), "便宜"),
+    (re.compile(r"恶心"), "恶心"),
+    (re.compile(r"钥匙"), "钥匙"),
+    (re.compile(r"朝阳"), "朝阳"),
+    (re.compile(r"朝夕"), "朝夕"),
+    (re.compile(r"朝代"), "朝代"),
+    (re.compile(r"朝前"), "朝前"),
+    (re.compile(r"商量"), "商量"),
+    (re.compile(r"产量"), "产量"),
+    (re.compile(r"测量"), "测量"),
+    (re.compile(r"血脉"), "血脉"),
+    (re.compile(r"流血"), "流血"),
+    (re.compile(r"鲜血"), "鲜血"),
+    (re.compile(r"壳子"), "壳子"),
+    (re.compile(r"地壳"), "地壳"),
+    (re.compile(r"薄雾"), "薄雾"),
+    (re.compile(r"薄弱"), "薄弱"),
+    (re.compile(r"薄荷"), "薄荷"),
+    (re.compile(r"转速"), "转速"),
+    (re.compile(r"效率"), "效率"),
+    (re.compile(r"概率"), "概率"),
+    (re.compile(r"率领"), "率领"),
+    (re.compile(r"绿林"), "绿林"),
+    (re.compile(r"红色"), "红色"),
+    (re.compile(r"干活"), "干活"),
+    (re.compile(r"干劲"), "干劲"),
+    (re.compile(r"干燥"), "干燥"),
+    (re.compile(r"才干"), "才干"),
+]
+
+
+def prepare_tts_text(text: str) -> str:
+    """结合上下文消歧多音字，仅用于语音合成。"""
+    if not text:
+        return text
+    out = text.replace("\u3000", " ").strip()
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    for pat, repl in _POLYPHONE_RULES:
+        out = pat.sub(repl, out)
+    return out
 
 
 # Edge TTS rate 实际上限约 +200%（≈3.0x），更高倍速需本地加速补齐
@@ -856,30 +1192,23 @@ def apply_playback_speed(src: Path, dst: Path, factor: float) -> None:
         sample_rate=24000,
     )
     pcm = decoded.samples
-    if not isinstance(pcm, array.array):
-        buf = array.array("h")
-        buf.frombytes(bytes(pcm))
-        pcm = buf
-    elif pcm.typecode != "h":
-        buf = array.array("h")
-        buf.frombytes(pcm.tobytes())
-        pcm = buf
+    if isinstance(pcm, array.array):
+        samples = np.frombuffer(pcm.tobytes(), dtype=np.int16)
+    else:
+        samples = np.frombuffer(bytes(pcm), dtype=np.int16)
 
-    n = len(pcm)
+    n = int(samples.size)
     if n <= 1:
         shutil.copy2(src, dst)
         return
 
     new_n = max(1, int(n / factor))
-    out = array.array("h")
-    for i in range(new_n):
-        pos = i * factor
-        i0 = int(pos)
-        if i0 >= n - 1:
-            out.append(pcm[n - 1])
-        else:
-            frac = pos - i0
-            out.append(int(pcm[i0] * (1.0 - frac) + pcm[i0 + 1] * frac))
+    idx = np.arange(new_n, dtype=np.float64) * float(factor)
+    i0 = np.floor(idx).astype(np.int64)
+    i0 = np.clip(i0, 0, n - 2)
+    frac = (idx - i0).astype(np.float32)
+    mixed = samples[i0].astype(np.float32) * (1.0 - frac) + samples[i0 + 1].astype(np.float32) * frac
+    out = np.clip(mixed, -32768, 32767).astype(np.int16)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(dst), "wb") as wf:
@@ -887,6 +1216,21 @@ def apply_playback_speed(src: Path, dst: Path, factor: float) -> None:
         wf.setsampwidth(2)
         wf.setframerate(24000)
         wf.writeframes(out.tobytes())
+
+
+def audio_duration_ms(path: Path, text: str = "", speed: float = 1.0) -> int:
+    """快速估算音频时长，避免每次用 mixer.Sound 解码。"""
+    try:
+        if path.suffix.lower() == ".wav":
+            with wave.open(str(path), "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate() or 24000
+                if frames > 0 and rate > 0:
+                    return max(300, int(frames / rate * 1000))
+    except Exception:
+        pass
+    cps = 4.5 * max(0.5, float(speed))
+    return max(600, int(len(text) / cps * 1000))
 
 
 def offset_to_sentence_index(body: str, offset: int) -> int:
@@ -1638,7 +1982,7 @@ class HotkeySettingsWindow(ctk.CTkToplevel):
 class NeuralPlayer:
     """微软 Edge 神经网络真人讲书播放器（讲述风格 + 预加载）。"""
 
-    PREFETCH = 3  # 提前合成几段，播放时不断档
+    PREFETCH = TTS_PREFETCH
 
     def __init__(self, on_status, on_sentence, on_finished):
         self.on_status = on_status
@@ -1679,15 +2023,15 @@ class NeuralPlayer:
 
     def _ensure_mixer(self) -> None:
         if not self._mixer_ready:
-            # 稍大缓冲，减少爆音/断续
-            pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=4096)
+            # 更大缓冲，减少块切换时的断续
+            pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=8192)
             self._mixer_ready = True
 
     def _cache_path(self, text: str, play_factor: float) -> Path:
-        # v3：TTS 语速与本地加速因子分开缓存；>3x 最终文件为 WAV
+        # v4：多音字消歧后的文本 + TTS/本地加速分开缓存
         tts_speed, _ = split_speed(self._speed)
         key = hashlib.md5(
-            f"v3|{self._voice_key}|{self._pitch}|{speed_to_rate(tts_speed)}|{play_factor:.3f}|{text}".encode(
+            f"v4|{self._voice_key}|{self._pitch}|{speed_to_rate(tts_speed)}|{play_factor:.3f}|{text}".encode(
                 "utf-8"
             )
         ).hexdigest()
@@ -1696,7 +2040,7 @@ class NeuralPlayer:
 
     def _raw_tts_cache_path(self, text: str, tts_speed: float) -> Path:
         key = hashlib.md5(
-            f"v3raw|{self._voice_key}|{self._pitch}|{speed_to_rate(tts_speed)}|{text}".encode(
+            f"v4raw|{self._voice_key}|{self._pitch}|{speed_to_rate(tts_speed)}|{text}".encode(
                 "utf-8"
             )
         ).hexdigest()
@@ -1763,66 +2107,217 @@ class NeuralPlayer:
                 pass
         self._temp_files.clear()
 
+    @staticmethod
+    def _is_retryable_tts_error(exc: BaseException) -> bool:
+        """弱网下几乎所有合成错误都可重试；仅明确停止/磁盘致命错误时放弃。"""
+        if str(exc) == "stopped":
+            return False
+        msg = str(exc).lower()
+        fatal = ("permission denied", "no space", "read-only", "access is denied")
+        if any(k in msg for k in fatal):
+            return False
+        return True
+
     async def _synthesize(self, text: str, out_path: Path, tts_speed: float) -> None:
         # edge-tts 会自行包装 SSML；只能传纯文本，否则会朗读 XML 标签
         rate = speed_to_rate(tts_speed)
-        communicate = edge_tts.Communicate(
-            text,
-            voice=self._voice_id,
-            rate=rate,
-            pitch=self._pitch,
-        )
-        await communicate.save(str(out_path))
-        if not out_path.exists() or out_path.stat().st_size <= 0:
-            raise RuntimeError("语音文件为空，请检查网络后重试")
+        tmp = out_path.with_suffix(out_path.suffix + ".partial")
+        last_err: BaseException | None = None
 
-    def _prepare_audio(self, text: str, loop: asyncio.AbstractEventLoop) -> Path:
+        for attempt in range(1, TTS_MAX_RETRIES + 1):
+            if self._stop.is_set():
+                raise RuntimeError("stopped")
+            try:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                communicate = edge_tts.Communicate(
+                    text,
+                    voice=self._voice_id,
+                    rate=rate,
+                    pitch=self._pitch,
+                    connect_timeout=TTS_CONNECT_TIMEOUT,
+                    receive_timeout=TTS_RECEIVE_TIMEOUT,
+                )
+                await communicate.save(str(tmp))
+                if not tmp.exists() or tmp.stat().st_size <= 0:
+                    raise RuntimeError("语音文件为空，请检查网络后重试")
+                tmp.replace(out_path)
+                return
+            except Exception as exc:
+                last_err = exc
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                if out_path.exists() and out_path.stat().st_size <= 0:
+                    try:
+                        out_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                if self._stop.is_set() or str(exc) == "stopped":
+                    raise RuntimeError("stopped") from exc
+                if (not self._is_retryable_tts_error(exc)) or attempt >= TTS_MAX_RETRIES:
+                    break
+                # 指数退避，弱网多等一会
+                delay = min(15.0, 0.8 * (2 ** (attempt - 1)))
+                try:
+                    self.on_status(f"网络不稳，重试语音 {attempt}/{TTS_MAX_RETRIES}…")
+                except Exception:
+                    pass
+                await asyncio.sleep(delay)
+
+        raise RuntimeError(
+            f"语音合成失败（已重试 {TTS_MAX_RETRIES} 次）: {last_err}"
+        )
+
+    async def _prepare_audio_async(self, text: str) -> Path:
+        speak = prepare_tts_text(text)
         tts_speed, play_factor = split_speed(self._speed)
-        cached = self._cache_path(text, play_factor)
+        cached = self._cache_path(speak, play_factor)
         if cached.exists() and cached.stat().st_size > 0:
             return cached
 
         if play_factor <= 1.01:
-            loop.run_until_complete(self._synthesize(text, cached, tts_speed))
+            await self._synthesize(speak, cached, tts_speed)
             return cached
 
         # >3x：先按 TTS 上限合成，再本地加速到目标倍速
-        raw = self._raw_tts_cache_path(text, tts_speed)
+        raw = self._raw_tts_cache_path(speak, tts_speed)
         if not (raw.exists() and raw.stat().st_size > 0):
-            loop.run_until_complete(self._synthesize(text, raw, tts_speed))
-        apply_playback_speed(raw, cached, play_factor)
+            await self._synthesize(speak, raw, tts_speed)
+        # 本地重采样放到线程池，避免阻塞事件循环
+        await asyncio.to_thread(apply_playback_speed, raw, cached, play_factor)
         if not cached.exists() or cached.stat().st_size <= 0:
             raise RuntimeError("本地倍速处理失败")
         return cached
-
-    def _estimate_duration_ms(self, path: Path, text: str) -> int:
-        try:
-            dur = pygame.mixer.Sound(str(path)).get_length()
-            if dur and dur > 0.2:
-                return max(300, int(dur * 1000))
-        except Exception:
-            pass
-        # 按字数粗估（约 4.5 字/秒，再按总倍速缩放）
-        cps = 4.5 * max(0.5, self._speed)
-        return max(600, int(len(text) / cps * 1000))
 
     def _producer_loop(self, chunks: list[tuple[int, int, str]], audio_q: queue.Queue) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            for start_i, end_i, text in chunks:
+            loop.run_until_complete(self._producer_async(chunks, audio_q))
+        finally:
+            loop.close()
+
+    async def _producer_async(
+        self, chunks: list[tuple[int, int, str]], audio_q: queue.Queue
+    ) -> None:
+        """滑动窗口并行合成：失败不跳过；等待当前段时仍继续预取后面，抗弱网断播。"""
+        if not chunks:
+            audio_q.put(None)
+            return
+
+        next_submit = 0
+        next_emit = 0
+        in_flight: dict[int, asyncio.Task] = {}
+        # 高倍速播得快，多囤几段；弱网时队列也更深
+        ahead = max(TTS_PARALLEL, min(self.PREFETCH, 2 + int(self._speed)))
+
+        async def prepare_until_ok(text: str) -> Path | None:
+            """当前段必须成功；失败退避重试，绝不跳过。"""
+            round_n = 0
+            while not self._stop.is_set():
+                try:
+                    return await self._prepare_audio_async(text)
+                except Exception as exc:
+                    if str(exc) == "stopped" or self._stop.is_set():
+                        return None
+                    round_n += 1
+                    delay = min(16.0, 1.0 * (1.6 ** min(round_n - 1, 7)))
+                    try:
+                        self.on_status(
+                            f"弱网重试中（第 {round_n} 轮）…稍后自动续播"
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(delay)
+            return None
+
+        async def run_one(text: str) -> Path:
+            path = await prepare_until_ok(text)
+            if path is None:
+                raise RuntimeError("stopped")
+            return path
+
+        def _submit_more() -> None:
+            nonlocal next_submit
+            while (
+                next_submit < len(chunks)
+                and next_submit < next_emit + ahead
+                and len(in_flight) < TTS_PARALLEL
+                and not self._stop.is_set()
+            ):
+                _a, _b, text = chunks[next_submit]
+                in_flight[next_submit] = asyncio.create_task(run_one(text))
+                next_submit += 1
+
+        try:
+            while next_emit < len(chunks) and not self._stop.is_set():
+                _submit_more()
+                start_i, end_i, text = chunks[next_emit]
+                task = in_flight.get(next_emit)
+                if task is None:
+                    # 窗口尚未提交到此段（极少见），补提交
+                    _a, _b, t = chunks[next_emit]
+                    in_flight[next_emit] = asyncio.create_task(run_one(t))
+                    if next_submit <= next_emit:
+                        next_submit = next_emit + 1
+                    task = in_flight[next_emit]
+
+                # 等待完成期间继续泵入后续任务，避免弱网时缓冲被抽干
+                while not task.done() and not self._stop.is_set():
+                    _submit_more()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=0.35)
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        break
+
+                in_flight.pop(next_emit, None)
                 if self._stop.is_set():
                     break
                 try:
-                    path = self._prepare_audio(text, loop)
-                    self._temp_files.append(path)
-                    audio_q.put((start_i, end_i, text, path))
+                    path = await task
                 except Exception as exc:
-                    audio_q.put(("error", str(exc)))
-                    return
-            audio_q.put(None)
+                    if str(exc) == "stopped" or self._stop.is_set():
+                        break
+                    path = await prepare_until_ok(text)
+                    if path is None:
+                        break
+
+                self._temp_files.append(path)
+                dur = audio_duration_ms(path, text, self._speed)
+                while not self._stop.is_set():
+                    try:
+                        audio_q.put((start_i, end_i, text, path, dur), timeout=0.2)
+                        break
+                    except queue.Full:
+                        # 队列满说明播放端还有存货，趁机多提交
+                        _submit_more()
+                        await asyncio.sleep(0.05)
+                next_emit += 1
+
+            if not self._stop.is_set():
+                audio_q.put(None)
+        except Exception as exc:
+            try:
+                self.on_status(f"语音任务异常，将尝试恢复: {str(exc)[:60]}")
+            except Exception:
+                pass
+            if not self._stop.is_set():
+                try:
+                    audio_q.put(None)
+                except Exception:
+                    pass
         finally:
-            loop.close()
+            for t in list(in_flight.values()):
+                if not t.done():
+                    t.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight.values(), return_exceptions=True)
 
     def _run(self, sentences: list[str], start_index: int) -> None:
         try:
@@ -1836,13 +2331,15 @@ class NeuralPlayer:
         if not remaining:
             self.on_finished()
             return
-        raw_chunks = merge_speech_chunks(remaining, max_chars=90)
+        raw_chunks = merge_speech_chunks(remaining, max_chars=SPEECH_CHUNK_CHARS)
         # 把块内下标映射回全书句子下标
         chunks = [
             (start_index + a, start_index + b, text) for a, b, text in raw_chunks
         ]
 
-        audio_q: queue.Queue = queue.Queue(maxsize=self.PREFETCH)
+        # 高倍速时加深队列，降低弱网抽干缓冲的概率
+        qsize = min(16, max(self.PREFETCH, self.PREFETCH + int(self._speed)))
+        audio_q: queue.Queue = queue.Queue(maxsize=qsize)
         self._audio_q = audio_q
         self.on_status("预加载语音中…")
 
@@ -1851,29 +2348,85 @@ class NeuralPlayer:
         )
         self._producer.start()
 
+        primed = False
         finished_naturally = False
+        start_need = min(TTS_START_BUFFER, len(chunks))
+        pending: list = []
+        underrun_since: float | None = None
+
+        def _take_next(timeout: float = 0.25):
+            nonlocal pending
+            if pending:
+                return pending.pop(0)
+            return audio_q.get(timeout=timeout)
+
         try:
-            while not self._stop.is_set():
+            # 开播前先囤几段，弱网也不至于播一段就空
+            while not self._stop.is_set() and len(pending) < start_need:
                 try:
-                    item = audio_q.get(timeout=0.2)
+                    item = audio_q.get(timeout=0.3)
                 except queue.Empty:
                     if self._producer and not self._producer.is_alive():
                         break
+                    self.on_status("预加载语音中…")
                     continue
+                if item is None:
+                    # 生产者已结束（很短章节或出错）
+                    if not pending:
+                        finished_naturally = not self._stop.is_set()
+                    break
+                if isinstance(item, tuple) and item and item[0] == "error":
+                    self.on_status(f"语音生成失败（需联网）: {str(item[1])[:80]}")
+                    return
+                pending.append(item)
+                self.on_status(f"预加载语音中… {len(pending)}/{start_need}")
+
+            while not self._stop.is_set():
+                try:
+                    item = _take_next(0.3)
+                    underrun_since = None
+                except queue.Empty:
+                    alive = self._producer is not None and self._producer.is_alive()
+                    if not alive:
+                        # 再扫一眼队列，避免竞态丢尾包
+                        try:
+                            item = audio_q.get_nowait()
+                            underrun_since = None
+                        except queue.Empty:
+                            if primed:
+                                self.on_status("网络中断，点播放可从当前位置继续")
+                            break
+                    else:
+                        if primed:
+                            if underrun_since is None:
+                                underrun_since = time.time()
+                            self.on_status("弱网缓冲中，稍后自动续播…")
+                        else:
+                            self.on_status("预加载语音中…")
+                        continue
 
                 if item is None:
                     finished_naturally = not self._stop.is_set()
                     break
                 if isinstance(item, tuple) and item and item[0] == "error":
-                    self.on_status(f"语音生成失败（需联网）: {item[1]}")
-                    break
-
-                start_i, end_i, text, path = item
+                    err = str(item[1] if len(item) > 1 else "未知错误")
+                    if "timeout" in err.lower() or "connection" in err.lower():
+                        self.on_status("网络超时，正在自动恢复…可稍候或检查网络")
+                    else:
+                        self.on_status(f"语音生成失败（需联网）: {err[:80]}")
+                    # 不直接结束全书：若队列里还有已合成段则继续
+                    continue
+                if len(item) == 5:
+                    start_i, end_i, text, path, duration_ms = item
+                else:
+                    start_i, end_i, text, path = item
+                    duration_ms = audio_duration_ms(path, text, self._speed)
+                primed = True
 
                 while not self._pause.is_set():
                     if self._stop.is_set():
                         break
-                    time.sleep(0.05)
+                    time.sleep(0.03)
                 if self._stop.is_set():
                     break
 
@@ -1881,7 +2434,6 @@ class NeuralPlayer:
                 self.on_sentence(start_i, start_i, sentences[start_i])
                 self.on_status(f"播放中 · {start_i + 1}-{end_i + 1}/{len(sentences)}")
 
-                duration_ms = self._estimate_duration_ms(path, text)
                 weights = [max(1, len(sentences[i])) for i in range(start_i, end_i + 1)]
                 total_w = float(sum(weights))
                 last_sent = start_i
@@ -1896,7 +2448,7 @@ class NeuralPlayer:
 
                 while not self._stop.is_set():
                     if not self._pause.is_set():
-                        time.sleep(0.05)
+                        time.sleep(0.03)
                         continue
                     if not pygame.mixer.music.get_busy():
                         break
@@ -1919,7 +2471,7 @@ class NeuralPlayer:
                             last_sent = cur
                             self.on_sentence(cur, cur, sentences[cur])
                             self.on_status(f"播放中 · 句 {cur + 1}/{len(sentences)}")
-                    time.sleep(0.04)
+                    time.sleep(0.02)
 
                 if not self._stop.is_set() and last_sent != end_i:
                     self.on_sentence(end_i, end_i, sentences[end_i])
@@ -1950,6 +2502,11 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         ensure_app_dir()
+        # Tk/Tcl 使用 UTF-8，避免目录 Listbox / 弹窗中文乱码
+        try:
+            self.tk.call("encoding", "system", "utf-8")
+        except Exception:
+            pass
 
         settings = load_json(SETTINGS_FILE, {})
         self.theme_name = settings.get("theme", DEFAULT_THEME)
@@ -1968,12 +2525,14 @@ class App(ctk.CTk):
         ctk.set_appearance_mode(self.theme.get("mode", "dark"))
         ctk.set_default_color_theme("dark-blue")
 
-        self.font_title = ctk.CTkFont(family="Microsoft YaHei UI", size=22, weight="bold")
-        self.font_h = ctk.CTkFont(family="Microsoft YaHei UI", size=16, weight="bold")
-        self.font_body = ctk.CTkFont(family="Microsoft YaHei UI", size=15)
-        self.font_ui = ctk.CTkFont(family="Microsoft YaHei UI", size=13)
-        self.font_small = ctk.CTkFont(family="Microsoft YaHei UI", size=11)
-        self.font_reader = ctk.CTkFont(family="Microsoft YaHei UI", size=16)
+        ui_font = pick_ui_font()
+        reader_font = pick_reader_font(self)
+        self.font_title = ctk.CTkFont(family=ui_font, size=24, weight="bold")
+        self.font_h = ctk.CTkFont(family=ui_font, size=16, weight="bold")
+        self.font_body = ctk.CTkFont(family=ui_font, size=15)
+        self.font_ui = ctk.CTkFont(family=ui_font, size=13)
+        self.font_small = ctk.CTkFont(family=ui_font, size=11)
+        self.font_reader = ctk.CTkFont(family=reader_font, size=18)
 
         self.file_path: Path | None = None
         self.chapters: list[tuple[str, str]] = []
@@ -2044,34 +2603,59 @@ class App(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
 
         # —— 左侧：品牌 + 导入 + 书架/目录 ——
-        sidebar = ctk.CTkFrame(self, width=332, corner_radius=0, fg_color=self.theme["sidebar"])
-        sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.grid_propagate(False)
+        sidebar_shell = ctk.CTkFrame(self, width=340, corner_radius=0, fg_color=self.theme["sidebar"])
+        sidebar_shell.grid(row=0, column=0, sticky="nsew")
+        sidebar_shell.grid_propagate(False)
+        sidebar_shell.grid_columnconfigure(1, weight=1)
+        sidebar_shell.grid_rowconfigure(0, weight=1)
+
+        # 左侧高亮灯带（夜间更醒目）
+        ctk.CTkFrame(
+            sidebar_shell, width=5, corner_radius=0, fg_color=self.theme.get("rail", self.theme["accent"])
+        ).grid(row=0, column=0, sticky="ns")
+
+        sidebar = ctk.CTkFrame(sidebar_shell, corner_radius=0, fg_color="transparent")
+        sidebar.grid(row=0, column=1, sticky="nsew")
         sidebar.grid_columnconfigure(0, weight=1)
         sidebar.grid_rowconfigure(5, weight=1)
 
         brand = ctk.CTkFrame(sidebar, fg_color="transparent")
-        brand.grid(row=0, column=0, sticky="ew", padx=18, pady=(22, 8))
-        ctk.CTkLabel(brand, text=APP_NAME, font=self.font_title, text_color=self.theme["text"], anchor="w").pack(
-            anchor="w"
+        brand.grid(row=0, column=0, sticky="ew", padx=16, pady=(22, 10))
+        brand_row = ctk.CTkFrame(brand, fg_color="transparent")
+        brand_row.pack(anchor="w", fill="x")
+        mark = ctk.CTkLabel(
+            brand_row,
+            text="听",
+            width=40,
+            height=40,
+            corner_radius=12,
+            fg_color=self.theme["accent"],
+            text_color=self.theme["on_accent"],
+            font=ctk.CTkFont(family=pick_ui_font(), size=18, weight="bold"),
         )
+        mark.pack(side="left", padx=(0, 10))
+        brand_text = ctk.CTkFrame(brand_row, fg_color="transparent")
+        brand_text.pack(side="left", fill="x", expand=True)
         ctk.CTkLabel(
-            brand,
-            text="真人讲书 · 多本书架",
+            brand_text, text=APP_NAME, font=self.font_title, text_color=self.theme["text"], anchor="w"
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            brand_text,
+            text="真人讲书 · 高清夜读",
             font=self.font_small,
-            text_color=self.theme["muted"],
+            text_color=self.theme["accent"],
             anchor="w",
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(anchor="w", pady=(1, 0))
 
         import_row = ctk.CTkFrame(sidebar, fg_color="transparent")
-        import_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(8, 8))
+        import_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(4, 10))
         import_row.grid_columnconfigure(0, weight=1)
         import_row.grid_columnconfigure(1, weight=1)
         ctk.CTkButton(
             import_row,
             text="导入小说",
-            height=36,
-            corner_radius=10,
+            height=38,
+            corner_radius=12,
             font=self.font_ui,
             fg_color=self.theme["accent"],
             hover_color=self.theme["accent_hover"],
@@ -2081,12 +2665,14 @@ class App(ctk.CTk):
         ctk.CTkButton(
             import_row,
             text="导入文件夹",
-            height=36,
-            corner_radius=10,
+            height=38,
+            corner_radius=12,
             font=self.font_ui,
             fg_color=self.theme["panel_soft"],
             hover_color=self.theme["chip"],
             text_color=self.theme["text"],
+            border_width=1,
+            border_color=self.theme["line"],
             command=self.import_folder,
         ).grid(row=0, column=1, sticky="ew", padx=(4, 4))
 
@@ -2168,7 +2754,7 @@ class App(ctk.CTk):
 
         # 顶栏：章节信息
         top = ctk.CTkFrame(main, fg_color=self.theme["bg"], height=72)
-        top.grid(row=0, column=0, sticky="ew", padx=22, pady=(18, 4))
+        top.grid(row=0, column=0, sticky="ew", padx=26, pady=(20, 6))
         top.grid_columnconfigure(0, weight=1)
         self.title_label = ctk.CTkLabel(
             top,
@@ -2179,13 +2765,17 @@ class App(ctk.CTk):
         )
         self.title_label.grid(row=0, column=0, sticky="w")
         self.file_label = ctk.CTkLabel(
-            top, text="支持 txt / pdf / epub / zip / 7z 等", font=self.font_small, text_color=self.theme["muted"], anchor="w"
+            top,
+            text="支持 txt / pdf / epub / zip / 7z 等 · 单击正文即可从此处朗读",
+            font=self.font_small,
+            text_color=self.theme["muted"],
+            anchor="w",
         )
-        self.file_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.file_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         # 搜索工具条
-        search_bar = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=12)
-        search_bar.grid(row=1, column=0, sticky="ew", padx=22, pady=(8, 10))
+        search_bar = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=16)
+        search_bar.grid(row=1, column=0, sticky="ew", padx=26, pady=(6, 12))
         search_bar.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
@@ -2250,7 +2840,7 @@ class App(ctk.CTk):
             corner_radius=8,
             fg_color=self.theme["play"],
             hover_color=self.theme["play_hover"],
-            text_color="#fff",
+            text_color=self.theme["on_accent"],
             font=self.font_small,
             command=self.play_from_match,
         ).grid(row=0, column=6, padx=(6, 8), pady=10)
@@ -2261,8 +2851,8 @@ class App(ctk.CTk):
         self.content_match_label.grid(row=0, column=7, padx=(0, 12), pady=10)
 
         # 阅读区
-        reader_wrap = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=14)
-        reader_wrap.grid(row=2, column=0, sticky="nsew", padx=22, pady=(0, 10))
+        reader_wrap = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=18)
+        reader_wrap.grid(row=2, column=0, sticky="nsew", padx=26, pady=(0, 12))
         reader_wrap.grid_columnconfigure(0, weight=1)
         reader_wrap.grid_rowconfigure(0, weight=1)
 
@@ -2272,20 +2862,20 @@ class App(ctk.CTk):
             font=self.font_reader,
             fg_color=self.theme["reader"],
             text_color=self.theme["text"],
-            corner_radius=12,
+            corner_radius=14,
             border_width=0,
             activate_scrollbars=True,
             scrollbar_button_color=self.theme["chip"],
             scrollbar_button_hover_color=self.theme["accent"],
         )
-        self.text_box.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 4))
+        self.text_box.grid(row=0, column=0, sticky="nsew", padx=14, pady=(14, 6))
         self._set_reader_text(
-            "欢迎使用听小说\n\n"
-            "1. 左侧「导入小说」可一次加入多本，也支持 zip / 7z 等压缩包\n"
-            "2. 「导入文件夹」可批量添加；压缩包会自动解压出其中的小说\n"
-            "3. 在「书架」里点选要听的书；「目录」里跳转章节\n"
-            "4. 底部选择「讲书音色」，点播放开始收听\n\n"
-            "单击正文可从该位置开始听；朗读时正文会高亮跟随。"
+            "欢迎来到听小说\n\n"
+            "把喜欢的小说放进书架，像坐进夜间书房一样慢慢听。\n\n"
+            "1. 左侧导入小说或文件夹（支持 zip / 7z）\n"
+            "2. 在书架选书，在目录跳章\n"
+            "3. 选好讲书音色，点播放\n\n"
+            "单击正文可从该处开听；朗读时句子会高亮跟随。"
         )
         self._setup_reader_readonly()
         try:
@@ -2332,53 +2922,55 @@ class App(ctk.CTk):
         self._bind_progress_slider_release()
 
         # 播放控制条（核心操作，置中放大）
-        dock = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=14)
-        dock.grid(row=3, column=0, sticky="ew", padx=22, pady=(0, 10))
+        dock = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=18)
+        dock.grid(row=3, column=0, sticky="ew", padx=26, pady=(0, 12))
         dock.grid_columnconfigure(0, weight=1)
         dock.grid_columnconfigure(1, weight=0)
         dock.grid_columnconfigure(2, weight=1)
 
         self.status_label = ctk.CTkLabel(
-            dock, text="就绪", font=self.font_small, text_color=self.theme["muted"], anchor="w"
+            dock, text="就绪 · 可以开始听了", font=self.font_small, text_color=self.theme["muted"], anchor="w"
         )
-        self.status_label.grid(row=0, column=0, sticky="w", padx=16, pady=14)
+        self.status_label.grid(row=0, column=0, sticky="w", padx=18, pady=16)
 
         transport = ctk.CTkFrame(dock, fg_color="transparent")
-        transport.grid(row=0, column=1, pady=10)
+        transport.grid(row=0, column=1, pady=12)
 
         btn_sec = dict(
-            width=88,
-            height=40,
-            corner_radius=10,
+            width=90,
+            height=42,
+            corner_radius=12,
             fg_color=self.theme["panel_soft"],
             hover_color=self.theme["chip"],
             text_color=self.theme["text"],
             font=self.font_ui,
+            border_width=1,
+            border_color=self.theme["line"],
         )
         self.btn_prev = ctk.CTkButton(transport, text="上一章", command=self.prev_chapter, **btn_sec)
         self.btn_prev.pack(side="left", padx=4)
         self.btn_play = ctk.CTkButton(
             transport,
             text="▶  播放",
-            width=120,
-            height=44,
-            corner_radius=12,
+            width=132,
+            height=48,
+            corner_radius=24,
             fg_color=self.theme["play"],
             hover_color=self.theme["play_hover"],
-            text_color="#fff",
-            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold"),
+            text_color=self.theme["on_accent"],
+            font=ctk.CTkFont(family=pick_ui_font(), size=16, weight="bold"),
             command=self.toggle_play,
         )
-        self.btn_play.pack(side="left", padx=8)
+        self.btn_play.pack(side="left", padx=10)
         self.btn_stop = ctk.CTkButton(
             transport,
             text="停止",
-            width=72,
-            height=40,
-            corner_radius=10,
+            width=74,
+            height=42,
+            corner_radius=12,
             fg_color=self.theme["stop"],
             hover_color=self.theme["stop_hover"],
-            text_color="#fff",
+            text_color="#fff8f6",
             font=self.font_ui,
             command=self.stop_play,
         )
@@ -2388,9 +2980,9 @@ class App(ctk.CTk):
         self.btn_mini = ctk.CTkButton(
             transport,
             text="小窗",
-            width=64,
-            height=40,
-            corner_radius=10,
+            width=66,
+            height=42,
+            corner_radius=12,
             fg_color=self.theme["accent_dim"],
             hover_color=self.theme["chip"],
             text_color=self.theme["accent"],
@@ -2400,13 +2992,18 @@ class App(ctk.CTk):
         self.btn_mini.pack(side="left", padx=(12, 4))
 
         self.speed_label = ctk.CTkLabel(
-            dock, text=speed_label(self.speed_value), font=self.font_ui, text_color=self.theme["accent"], width=64, anchor="e"
+            dock,
+            text=speed_label(self.speed_value),
+            font=ctk.CTkFont(family=pick_ui_font(), size=14, weight="bold"),
+            text_color=self.theme["accent"],
+            width=64,
+            anchor="e",
         )
-        self.speed_label.grid(row=0, column=2, sticky="e", padx=16, pady=14)
+        self.speed_label.grid(row=0, column=2, sticky="e", padx=18, pady=16)
 
         # 设置条：速度 / 音量 / 音色 一行化
-        settings = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=14)
-        settings.grid(row=4, column=0, sticky="ew", padx=22, pady=(0, 18))
+        settings = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=18)
+        settings.grid(row=4, column=0, sticky="ew", padx=26, pady=(0, 22))
         settings.grid_columnconfigure(1, weight=2)
         settings.grid_columnconfigure(3, weight=1)
         settings.grid_columnconfigure(5, weight=1)
@@ -2514,20 +3111,20 @@ class App(ctk.CTk):
 
         self.btn_theme_night = ctk.CTkButton(
             theme_row,
-            text="夜间 · 黑",
-            width=100,
+            text="夜间 · 书房",
+            width=110,
             height=34,
-            corner_radius=8,
+            corner_radius=10,
             font=self.font_ui,
             command=lambda: self._on_theme_change("夜间"),
         )
         self.btn_theme_night.pack(side="left", padx=(0, 8))
         self.btn_theme_day = ctk.CTkButton(
             theme_row,
-            text="日间 · 白",
-            width=100,
+            text="日间 · 素纸",
+            width=110,
             height=34,
-            corner_radius=8,
+            corner_radius=10,
             font=self.font_ui,
             command=lambda: self._on_theme_change("日间"),
         )
@@ -2896,12 +3493,14 @@ class App(ctk.CTk):
             borderwidth=0,
             highlightthickness=0,
             exportselection=False,
-            font=("Microsoft YaHei UI", 11),
+            font=(pick_ui_font(), 11),
             bg=self.theme["panel"],
             fg=self.theme["text"],
             selectbackground=self.theme["accent"],
             selectforeground=self.theme["on_accent"],
             relief="flat",
+            highlightbackground=self.theme["panel"],
+            highlightcolor=self.theme["accent"],
         )
         sb = tk.Scrollbar(
             host,
@@ -4346,6 +4945,7 @@ class App(ctk.CTk):
 
 
 def main() -> None:
+    _configure_app_encoding()
     app = App()
     app.mainloop()
 

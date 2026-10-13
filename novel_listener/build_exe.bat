@@ -6,6 +6,8 @@ python -m PyInstaller --noconfirm --clean --windowed --onefile ^
   --name "听小说" ^
   --hidden-import=edge_tts ^
   --hidden-import=aiohttp ^
+  --hidden-import=miniaudio ^
+  --hidden-import=numpy ^
   --hidden-import=pypdf ^
   --hidden-import=docx ^
   --hidden-import=ebooklib ^
