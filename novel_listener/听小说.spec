@@ -1,14 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['piper', 'piper.voice', 'piper.config', 'piper.espeakbridge', 'piper.phonemize_espeak', 'onnxruntime', 'edge_tts', 'aiohttp', 'miniaudio', 'numpy', 'pypdf', 'docx', 'ebooklib', 'bs4', 'lxml', 'striprtf', 'py7zr', 'pythoncom', 'win32com.client']
-datas += collect_data_files('piper')
+hiddenimports = ['edge_tts', 'aiohttp', 'miniaudio', 'numpy', 'pypdf', 'docx', 'ebooklib', 'bs4', 'lxml', 'striprtf', 'py7zr', 'pythoncom', 'win32com.client']
 tmp_ret = collect_all('customtkinter')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('onnxruntime')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('edge_tts')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
@@ -27,7 +23,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['torch', 'torchvision', 'torchaudio', 'piper.train', 'scipy', 'pandas'],
+    excludes=['torch', 'torchvision', 'torchaudio', 'piper', 'onnxruntime', 'scipy', 'pandas'],
     noarchive=False,
     optimize=0,
 )

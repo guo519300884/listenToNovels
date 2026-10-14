@@ -1,15 +1,9 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-echo Packaging listen-novel exe (Piper + SAPI + Edge TTS)...
+echo Packaging listen-novel exe (Edge TTS + SAPI)...
 python -m PyInstaller --noconfirm --clean --windowed --onefile ^
-  --name "???" ^
-  --hidden-import=piper ^
-  --hidden-import=piper.voice ^
-  --hidden-import=piper.config ^
-  --hidden-import=piper.espeakbridge ^
-  --hidden-import=piper.phonemize_espeak ^
-  --hidden-import=onnxruntime ^
+  --name "听小说" ^
   --hidden-import=edge_tts ^
   --hidden-import=aiohttp ^
   --hidden-import=miniaudio ^
@@ -26,12 +20,11 @@ python -m PyInstaller --noconfirm --clean --windowed --onefile ^
   --exclude-module=torch ^
   --exclude-module=torchvision ^
   --exclude-module=torchaudio ^
-  --exclude-module=piper.train ^
+  --exclude-module=piper ^
+  --exclude-module=onnxruntime ^
   --exclude-module=scipy ^
   --exclude-module=pandas ^
-  --collect-data piper ^
   --collect-all customtkinter ^
-  --collect-all onnxruntime ^
   --collect-all edge_tts ^
   --collect-all ebooklib ^
   --collect-all py7zr ^
@@ -41,5 +34,4 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Done: dist\???.exe
-echo Keep voices\ folder next to the exe.
+echo Done: dist\听小说.exe

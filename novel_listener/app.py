@@ -1,5 +1,5 @@
 ﻿# -*- coding: utf-8 -*-
-"""听小说 — Piper 本地神经网络 + Windows 系统语音 + 微软在线（可选）三后端"""
+"""听小说 — 微软在线语音 + Windows 系统语音双后端"""
 
 from __future__ import annotations
 
@@ -78,7 +78,6 @@ PROGRESS_FILE = APP_DIR / "progress.json"
 SETTINGS_FILE = APP_DIR / "settings.json"
 LIBRARY_FILE = APP_DIR / "library.json"
 CACHE_DIR = APP_DIR / "tts_cache"
-VOICES_DIR = APP_DIR / "voices"
 
 NOVEL_FILETYPES = [
     (
@@ -231,23 +230,22 @@ def pick_reader_font(master=None) -> str:
     return "Microsoft YaHei UI"
 
 
-# 音色：(配置键, 显示名, 后端 piper|sapi|edge, 模型/语音ID, edge音调)
+# 音色：(配置键, 显示名, 后端 edge|sapi, 模型/语音ID, edge音调)
 VOICE_PROFILES: list[tuple[str, str, str, str, str]] = [
     ("xiaoxiao_relaxed", "晓晓 · 在线轻松讲书（有网推荐）", "edge", "zh-CN-XiaoxiaoNeural", "-2Hz"),
     ("yunyang_pro", "云扬 · 在线专业播讲", "edge", "zh-CN-YunyangNeural", "-1Hz"),
     ("yunxi_calm", "云希 · 在线平静讲述", "edge", "zh-CN-YunxiNeural", "-2Hz"),
     ("xiaoyi", "晓伊 · 在线自然女声", "edge", "zh-CN-XiaoyiNeural", "-1Hz"),
     ("yunjian", "云健 · 在线自然男声", "edge", "zh-CN-YunjianNeural", "+0Hz"),
-    ("piper_huayan", "华严 · 本地神经网络（无网推荐）", "piper", "zh_CN-huayan-medium", ""),
-    ("sapi_auto", "系统语音 · 免下载离线", "sapi", "auto", ""),
+    ("sapi_auto", "系统语音 · 离线兜底", "sapi", "auto", ""),
 ]
 ONLINE_DEFAULT_VOICE_KEY = "xiaoxiao_relaxed"
-OFFLINE_DEFAULT_VOICE_KEY = "piper_huayan"
+OFFLINE_DEFAULT_VOICE_KEY = "sapi_auto"
 DEFAULT_VOICE_KEY = ONLINE_DEFAULT_VOICE_KEY
 
 
 def is_network_online(timeout: float = 2.0) -> bool:
-    """快速探测外网（优先微软语音相关域名），用于选择默认语音后端。"""
+    """快速探测外网（优先微软语音相关域名）。"""
     probes = (
         "https://api.msftconnecttest.com/connecttest.txt",
         "https://www.msftconnecttest.com/connecttest.txt",
@@ -265,9 +263,17 @@ def is_network_online(timeout: float = 2.0) -> bool:
     return False
 
 
+def is_edge_unreachable(timeout: float = 3.0) -> bool:
+    """连续两次探测都失败，才认定在线语音通道不通（避免抖动误切系统音）。"""
+    if is_network_online(timeout):
+        return False
+    time.sleep(0.8)
+    return not is_network_online(timeout)
+
+
 def pick_default_voice_key() -> str:
-    """有网默认微软在线，无网默认 Piper。"""
-    if EDGE_TTS_AVAILABLE and is_network_online():
+    """默认始终微软在线；仅未安装 edge-tts 时用系统语音。"""
+    if EDGE_TTS_AVAILABLE:
         return ONLINE_DEFAULT_VOICE_KEY
     return OFFLINE_DEFAULT_VOICE_KEY
 
@@ -278,22 +284,9 @@ _LEGACY_VOICE_MAP = {
     "xiaoxiao_gentle": "xiaoxiao_relaxed",
     "yunyang_news": "yunyang_pro",
     "yunxi_chat": "yunxi_calm",
+    "piper_huayan": "xiaoxiao_relaxed",
 }
 
-# Piper 模型相对路径（HuggingFace rhasspy/piper-voices）
-PIPER_MODEL_FILES: dict[str, tuple[str, str]] = {
-    "zh_CN-huayan-medium": (
-        "zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx",
-        "zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json",
-    ),
-}
-PIPER_MIRRORS = (
-    "https://hf-mirror.com/rhasspy/piper-voices/resolve/v1.0.0/",
-    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/",
-)
-
-_piper_voices: dict[str, object] = {}
-_piper_lock = threading.Lock()
 _sapi_lock = threading.Lock()
 
 
@@ -309,160 +302,6 @@ def get_voice_profile(key: str | None) -> tuple[str, str, str, str, str]:
             if p[3] == key:
                 return p
     return VOICE_PROFILES[0]
-
-
-def _app_bundle_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-def voice_search_dirs() -> list[Path]:
-    dirs = [_app_bundle_dir() / "voices", VOICES_DIR]
-    # 去重保序
-    seen: set[str] = set()
-    out: list[Path] = []
-    for d in dirs:
-        k = str(d.resolve()) if d.exists() else str(d)
-        if k not in seen:
-            seen.add(k)
-            out.append(d)
-    return out
-
-
-def find_piper_model(model_id: str) -> Path | None:
-    onnx_name = f"{model_id}.onnx"
-    for d in voice_search_dirs():
-        p = d / onnx_name
-        j = d / f"{model_id}.onnx.json"
-        if p.exists() and p.stat().st_size > 1000 and j.exists():
-            return p
-    return None
-
-
-def ensure_piper_model(model_id: str, on_status=None) -> Path:
-    """确保 Piper 模型在本地；缺失则从镜像下载一次。"""
-    existing = find_piper_model(model_id)
-    if existing is not None:
-        return existing
-    files = PIPER_MODEL_FILES.get(model_id)
-    if not files:
-        raise RuntimeError(f"未知语音模型: {model_id}")
-    VOICES_DIR.mkdir(parents=True, exist_ok=True)
-    rel_onnx, rel_json = files
-    targets = [
-        (rel_onnx, VOICES_DIR / f"{model_id}.onnx"),
-        (rel_json, VOICES_DIR / f"{model_id}.onnx.json"),
-    ]
-    for rel, dest in targets:
-        if dest.exists() and dest.stat().st_size > 100:
-            continue
-        last_err: Exception | None = None
-        for mirror in PIPER_MIRRORS:
-            url = mirror + rel
-            try:
-                if on_status:
-                    on_status(f"首次下载本地语音模型…（仅一次）")
-                tmp = dest.with_suffix(dest.suffix + ".part")
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                req = urllib.request.Request(url, headers={"User-Agent": "novel-listener/1.0"})
-                with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as f:
-                    shutil.copyfileobj(resp, f)
-                if tmp.stat().st_size < 100:
-                    raise RuntimeError("下载文件过小")
-                tmp.replace(dest)
-                last_err = None
-                break
-            except Exception as exc:
-                last_err = exc
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                continue
-        if last_err is not None:
-            raise RuntimeError(
-                f"本地语音模型下载失败，可改用「系统语音」或手动放入：{VOICES_DIR}\n{last_err}"
-            ) from last_err
-    found = find_piper_model(model_id)
-    if found is None:
-        raise RuntimeError("本地语音模型准备失败")
-    return found
-
-
-def load_piper_voice(model_id: str, on_status=None):
-    with _piper_lock:
-        cached = _piper_voices.get(model_id)
-        if cached is not None:
-            return cached
-        from piper import PiperVoice
-
-        path = ensure_piper_model(model_id, on_status=on_status)
-        if on_status:
-            on_status("正在加载本地神经网络音色…")
-        voice = PiperVoice.load(str(path))
-        _piper_voices[model_id] = voice
-        return voice
-
-
-def _prepare_piper_text(text: str) -> str:
-    """整理标点与停顿，让 Piper 中文听感更自然。"""
-    t = (text or "").strip()
-    if not t:
-        return t
-    t = re.sub(r"[ \t]+", " ", t).strip()
-    t = re.sub(r"\n+", "。", t)
-    # 统一中文标点，便于韵律切分
-    repl = {
-        ",": "，",
-        ";": "；",
-        ":": "：",
-        "!": "！",
-        "?": "？",
-        "...": "……",
-        "…": "……",
-    }
-    for a, b in repl.items():
-        t = t.replace(a, b)
-    t = re.sub(r"[，]{2,}", "，", t)
-    t = re.sub(r"[。]{2,}", "。", t)
-    if t[-1] not in "。！？；…」』》":
-        t += "。"
-    return t
-
-
-def synthesize_piper_to_wav(
-    text: str, out_path: Path, model_id: str, tts_speed: float, on_status=None
-) -> None:
-    from piper import SynthesisConfig
-
-    voice = load_piper_voice(model_id, on_status=on_status)
-    speak = _prepare_piper_text(text)
-    # 略放慢基础语速提升清晰度；再按用户倍速缩放（length_scale 越大越慢）
-    base_clarity = 1.12
-    speed = max(0.5, min(float(tts_speed), TTS_MAX_SPEED))
-    length_scale = base_clarity / speed
-    cfg = SynthesisConfig(
-        length_scale=length_scale,
-        noise_scale=0.55,  # 略降噪声，更干净
-        noise_w_scale=0.7,
-        normalize_audio=True,
-        volume=1.0,
-    )
-    tmp = out_path.with_suffix(out_path.suffix + ".partial")
-    try:
-        tmp.unlink(missing_ok=True)
-    except Exception:
-        pass
-    with _piper_lock:
-        with wave.open(str(tmp), "wb") as wf:
-            voice.synthesize_wav(speak, wf, syn_config=cfg)
-    if not tmp.exists() or tmp.stat().st_size <= 44:
-        raise RuntimeError("本地神经网络合成结果为空")
-    tmp.replace(out_path)
 
 
 def list_sapi_chinese_voices() -> list[tuple[str, str]]:
@@ -1363,7 +1202,7 @@ def split_sentences(text: str) -> list[str]:
 # 朗读块：偏短更抗弱网（单次请求不易超时），仍保留一定上下文消歧多音字
 SPEECH_CHUNK_CHARS = 200
 TTS_PARALLEL_EDGE = 2  # 在线微软：并行预加载（与旧版一致）
-TTS_PARALLEL_LOCAL = 1  # 本地 Piper/SAPI：串行更稳
+TTS_PARALLEL_LOCAL = 1  # 本地 SAPI：串行更稳
 TTS_PREFETCH_EDGE = 8  # 在线预取深度
 TTS_PREFETCH_LOCAL = 4
 TTS_START_BUFFER = 2  # 开播前至少就绪段数
@@ -2358,7 +2197,7 @@ class HotkeySettingsWindow(ctk.CTkToplevel):
 
 
 class NeuralPlayer:
-    """微软在线 / Piper 本地 / 系统语音三后端播放器（预加载）。"""
+    """微软在线 / Windows 系统语音双后端播放器（预加载）。"""
 
     def __init__(self, on_status, on_sentence, on_finished):
         self.on_status = on_status
@@ -2510,19 +2349,8 @@ class NeuralPlayer:
                 pass
         self._temp_files.clear()
 
-    def _synthesize_offline(self, text: str, out_path: Path, tts_speed: float, prefer: str) -> None:
-        """离线合成：piper / sapi。"""
-        if prefer == "piper":
-            model = self._voice_ref if self._backend == "piper" else "zh_CN-huayan-medium"
-            synthesize_piper_to_wav(
-                text, out_path, model, tts_speed, on_status=self.on_status
-            )
-        else:
-            match = self._voice_ref if self._backend == "sapi" else "auto"
-            synthesize_sapi_to_wav(text, out_path, tts_speed, voice_match=match or "auto")
-
     async def _synthesize(self, text: str, out_path: Path, tts_speed: float) -> None:
-        """三后端：edge 在线 / piper 本地 / sapi 系统；失败自动 Piper→系统语音。"""
+        """双后端：edge 在线 / sapi 系统；有网坚持在线重试，确认无网才切系统语音。"""
         if self._stop.is_set():
             raise RuntimeError("stopped")
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2550,48 +2378,18 @@ class NeuralPlayer:
                     pass
 
         if backend == "edge":
-            # 有网时坚持微软在线：段内多次重试，不因偶发失败立刻切 Piper
             try:
                 await _edge_to_wav()
                 return
             except Exception as exc:
                 if self._stop.is_set() or str(exc) == "stopped":
                     raise RuntimeError("stopped") from exc
-                online = await asyncio.to_thread(is_network_online, 2.0)
-                if online:
-                    # 仍判定有网：继续抛出，由外层 prepare_until_ok 再重试在线
+                # 段内已多次重试仍失败：仅在确认通道不通时才临时用系统音，否则继续抛出让外层重试在线
+                unreachable = await asyncio.to_thread(is_edge_unreachable, 3.0)
+                if not unreachable:
                     raise RuntimeError(f"在线语音暂时失败（将继续重试）: {exc}") from exc
                 try:
-                    self.on_status("当前无网，临时改用本地神经网络…")
-                except Exception:
-                    pass
-                try:
-                    await asyncio.to_thread(self._synthesize_offline, text, out_path, tts_speed, "piper")
-                    return
-                except Exception:
-                    try:
-                        self.on_status("本地神经网络失败，改用系统语音…")
-                    except Exception:
-                        pass
-                    await asyncio.to_thread(self._synthesize_offline, text, out_path, tts_speed, "sapi")
-                    return
-
-        if backend == "piper":
-            try:
-                await asyncio.to_thread(
-                    synthesize_piper_to_wav,
-                    text,
-                    out_path,
-                    ref,
-                    tts_speed,
-                    self.on_status,
-                )
-                return
-            except Exception as exc:
-                if self._stop.is_set():
-                    raise RuntimeError("stopped") from exc
-                try:
-                    self.on_status("本地神经网络不可用，改用系统语音…")
+                    self.on_status("在线语音实在不通，本段临时改用系统语音…")
                 except Exception:
                     pass
                 await asyncio.to_thread(
@@ -3022,7 +2820,7 @@ class App(ctk.CTk):
                 self.speed_value = 1.0
         self._speed_apply_job: str | None = None
         self.volume_value = float(settings.get("volume", 1.0))
-        # 未手动选过音色：有网默认微软在线，无网默认 Piper
+        # 未手动选过音色：默认始终微软在线（系统音仅运行时兜底）
         self._voice_user_set = bool(settings.get("voice_user_set"))
         if self._voice_user_set and settings.get("voice_id"):
             self.voice_id = get_voice_profile(settings.get("voice_id"))[0]
@@ -4644,17 +4442,13 @@ class App(ctk.CTk):
             messagebox.showinfo(APP_NAME, "当前章节没有可朗读的内容。")
             return
         idx = self.sentence_index if from_index is None else from_index
-        # 未手动指定：有网锁微软在线，无网才用 Piper；探测抖动时也优先保持在线音色
-        if not self._voice_user_set:
-            cur_backend = get_voice_profile(self.voice_id)[2]
-            online = is_network_online(2.0)
-            if online and EDGE_TTS_AVAILABLE:
-                key = ONLINE_DEFAULT_VOICE_KEY
-            else:
-                key = OFFLINE_DEFAULT_VOICE_KEY
-            # 已在用在线音色且仍有网：不要切走
-            if cur_backend == "edge" and online:
-                key = self.voice_id if get_voice_profile(self.voice_id)[2] == "edge" else ONLINE_DEFAULT_VOICE_KEY
+        # 未手动指定：始终锁定微软在线；系统音只在合成层确认不通时临时兜底，不改默认音色
+        if not self._voice_user_set and EDGE_TTS_AVAILABLE:
+            key = (
+                self.voice_id
+                if get_voice_profile(self.voice_id)[2] == "edge"
+                else ONLINE_DEFAULT_VOICE_KEY
+            )
             if key != self.voice_id and any(vid == key for vid, _ in self.voices):
                 self.voice_id = key
                 if hasattr(self, "voice_menu"):
@@ -4852,7 +4646,7 @@ class App(ctk.CTk):
         self.player.configure(self.speed_value, self.voice_id, self.volume_value)
         self._save_settings_only()
         backend = get_voice_profile(self.voice_id)[2]
-        tip = {"edge": "在线", "piper": "本地神经网络", "sapi": "系统"}.get(backend, "")
+        tip = {"edge": "在线", "sapi": "系统"}.get(backend, "")
         if self.playing:
             self._ui_status(f"音色已切换为{tip}（下一段生效）")
         else:
