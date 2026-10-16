@@ -1,11 +1,9 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-echo Packaging listen-novel exe (Edge TTS + SAPI)...
+echo Packaging 听小说.exe (Edge online TTS + SAPI fallback)...
 python -m PyInstaller --noconfirm --clean --windowed --onefile ^
   --name "听小说" ^
-  --hidden-import=edge_tts ^
-  --hidden-import=aiohttp ^
   --hidden-import=miniaudio ^
   --hidden-import=numpy ^
   --hidden-import=pypdf ^
@@ -24,10 +22,11 @@ python -m PyInstaller --noconfirm --clean --windowed --onefile ^
   --exclude-module=onnxruntime ^
   --exclude-module=scipy ^
   --exclude-module=pandas ^
+  --exclude-module=darkdetect ^
   --collect-all customtkinter ^
-  --collect-all edge_tts ^
   --collect-all ebooklib ^
   --collect-all py7zr ^
+  --collect-all edge_tts ^
   app.py
 if errorlevel 1 (
   echo Build failed

@@ -9,9 +9,11 @@ import ctypes
 import gzip
 import hashlib
 import json
+import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import threading
@@ -24,25 +26,76 @@ from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, messagebox
 import tkinter as tk
+import types
+
+# 部分 Windows 上 WMI/`platform` 会卡死；必须在 import UI / TTS 依赖前注入 stub。
+if "platform" not in sys.modules:
+    _platform_stub = types.ModuleType("platform")
+    _platform_stub.release = lambda: "10"  # type: ignore[attr-defined]
+    _platform_stub.version = lambda: "10.0.26100"  # type: ignore[attr-defined]
+    _platform_stub.system = lambda: "Windows"  # type: ignore[attr-defined]
+    _platform_stub.machine = lambda: "AMD64"  # type: ignore[attr-defined]
+    _platform_stub.processor = lambda: ""  # type: ignore[attr-defined]
+    _platform_stub.platform = lambda *_a, **_k: "Windows-10-10.0.26100-SP0"  # type: ignore[attr-defined]
+    _platform_stub.architecture = lambda *_a, **_k: ("64bit", "WindowsPE")  # type: ignore[attr-defined]
+    _platform_stub.python_version = lambda: "%d.%d.%d" % sys.version_info[:3]  # type: ignore[attr-defined]
+    _platform_stub.python_implementation = lambda: "CPython"  # type: ignore[attr-defined]
+
+    class _UnameResult:
+        system = "Windows"
+        node = ""
+        release = "10"
+        version = "10.0.26100"
+        machine = "AMD64"
+        processor = ""
+
+        def __iter__(self):
+            return iter(
+                (self.system, self.node, self.release, self.version, self.machine, self.processor)
+            )
+
+        def __getitem__(self, i):
+            return (
+                self.system,
+                self.node,
+                self.release,
+                self.version,
+                self.machine,
+                self.processor,
+            )[i]
+
+    _platform_stub.uname = lambda: _UnameResult()  # type: ignore[attr-defined]
+    _platform_stub.win32_ver = lambda *_a, **_k: ("10", "10.0.26100", "SP0", "Multiprocessor Free")  # type: ignore[attr-defined]
+    _platform_stub.system_alias = lambda s, r, v: (s, r, v)  # type: ignore[attr-defined]
+    _platform_stub.mac_ver = lambda: ("", ("", "", ""), "")  # type: ignore[attr-defined]
+    _platform_stub.libc_ver = lambda: ("", "")  # type: ignore[attr-defined]
+    _platform_stub.java_ver = lambda: ("", "", ("", "", ""), ("", "", ""))  # type: ignore[attr-defined]
+    _platform_stub.freedesktop_os_release = lambda: {}  # type: ignore[attr-defined]
+    _platform_stub.__version__ = "stub"
+    sys.modules["platform"] = _platform_stub
+
+if "darkdetect" not in sys.modules:
+    _darkdetect_stub = types.ModuleType("darkdetect")
+    _darkdetect_stub.__version__ = "0.0-stub"
+    _darkdetect_stub.theme = lambda: "Dark"  # type: ignore[attr-defined]
+    _darkdetect_stub.isDark = lambda: True  # type: ignore[attr-defined]
+    _darkdetect_stub.isLight = lambda: False  # type: ignore[attr-defined]
+    _darkdetect_stub.listener = lambda callback: None  # type: ignore[attr-defined]
+    sys.modules["darkdetect"] = _darkdetect_stub
 
 import customtkinter as ctk
 import miniaudio
 import numpy as np
 import pygame
 
-try:
-    import edge_tts  # type: ignore
-
-    EDGE_TTS_AVAILABLE = True
-except Exception:
-    edge_tts = None  # type: ignore
-    EDGE_TTS_AVAILABLE = False
-
-
+# edge-tts 启动后懒加载（有 platform stub 后可在主进程内合成，避免 onefile 子进程越跑越慢）
+edge_tts = None  # type: ignore
+EDGE_TTS_AVAILABLE = True
+_EDGE_TTS_READY = False
+_EDGE_TTS_FAILED = False
+_EDGE_TTS_LOCK = threading.Lock()
 def _patch_edge_tts_endpoint() -> None:
     """微软旧 WSS 会 403；切换到 api.msedgeservices.com。"""
-    if not EDGE_TTS_AVAILABLE:
-        return
     try:
         import edge_tts.communicate as _comm
         import edge_tts.constants as _const
@@ -70,7 +123,88 @@ def _patch_edge_tts_endpoint() -> None:
         pass
 
 
-_patch_edge_tts_endpoint()
+def ensure_edge_tts() -> bool:
+    """主进程内懒加载 edge-tts（有 platform stub 后可正常 import）。"""
+    global edge_tts, EDGE_TTS_AVAILABLE, _EDGE_TTS_READY, _EDGE_TTS_FAILED
+    if _EDGE_TTS_READY and edge_tts is not None:
+        return True
+    if _EDGE_TTS_FAILED:
+        return False
+    with _EDGE_TTS_LOCK:
+        if _EDGE_TTS_READY and edge_tts is not None:
+            return True
+        if _EDGE_TTS_FAILED:
+            return False
+        try:
+            import edge_tts as _mod  # type: ignore
+
+            edge_tts = _mod
+            _patch_edge_tts_endpoint()
+            EDGE_TTS_AVAILABLE = True
+            _EDGE_TTS_READY = True
+            return True
+        except Exception:
+            EDGE_TTS_AVAILABLE = False
+            _EDGE_TTS_FAILED = True
+            edge_tts = None
+            return False
+
+
+def warmup_edge_tts_async() -> None:
+    threading.Thread(target=ensure_edge_tts, daemon=True, name="edge-tts-warmup").start()
+
+
+# 语音缓存硬上限：绝不再膨胀到拖慢磁盘（约 300 个文件 / 200MB）
+TTS_CACHE_MAX_FILES = 300
+TTS_CACHE_MAX_MB = 200.0
+_tts_cache_ops = 0
+_tts_cache_lock = threading.Lock()
+
+
+def cleanup_tts_cache(
+    max_files: int = TTS_CACHE_MAX_FILES, max_mb: float = TTS_CACHE_MAX_MB
+) -> None:
+    """清理膨胀的语音缓存与残留临时文件，避免越用越慢。"""
+    try:
+        if not CACHE_DIR.exists():
+            return
+        # 残留临时文件一律删
+        for pat in ("*.partial", "*.edge.mp3", "*.tmp", "*.mp3"):
+            for p in CACHE_DIR.glob(pat):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        files = [f for f in CACHE_DIR.iterdir() if f.is_file()]
+        if not files:
+            return
+        files.sort(key=lambda f: f.stat().st_mtime)
+        total = sum(f.stat().st_size for f in files)
+        limit = int(max_mb * 1024 * 1024)
+        while files and (len(files) > max_files or total > limit):
+            victim = files.pop(0)
+            try:
+                sz = victim.stat().st_size
+            except Exception:
+                sz = 0
+            try:
+                victim.unlink(missing_ok=True)
+                total = max(0, total - sz)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def note_tts_cache_write() -> None:
+    """每次写入缓存后轻量维护；每 20 次做一次 LRU 清理。"""
+    global _tts_cache_ops
+    with _tts_cache_lock:
+        _tts_cache_ops += 1
+        n = _tts_cache_ops
+    if n == 1 or n % 20 == 0:
+        cleanup_tts_cache()
+
 
 APP_NAME = "听小说"
 APP_DIR = Path.home() / ".novel_listener"
@@ -304,24 +438,40 @@ def get_voice_profile(key: str | None) -> tuple[str, str, str, str, str]:
     return VOICE_PROFILES[0]
 
 
-def list_sapi_chinese_voices() -> list[tuple[str, str]]:
-    """返回 [(token/描述片段, 显示名), ...]。"""
-    try:
-        import win32com.client
+def list_sapi_chinese_voices(timeout: float = 3.0) -> list[tuple[str, str]]:
+    """返回 [(token/描述片段, 显示名), ...]；超时则返回空，避免 COM 卡住启动。"""
+    holder: dict[str, list[tuple[str, str]]] = {"out": []}
 
-        voice = win32com.client.Dispatch("SAPI.SpVoice")
-        out: list[tuple[str, str]] = []
-        for v in voice.GetVoices():
-            desc = str(v.GetDescription())
-            low = desc.lower()
-            if any(
-                k in desc or k in low
-                for k in ("Chinese", "中文", "Huihui", "Yaoyao", "Kangkang", "zh-CN", "Chinese (Simplified)")
-            ):
-                out.append((desc, f"系统 · {desc}"))
-        return out
-    except Exception:
-        return []
+    def _worker() -> None:
+        try:
+            import win32com.client
+
+            voice = win32com.client.Dispatch("SAPI.SpVoice")
+            out: list[tuple[str, str]] = []
+            for v in voice.GetVoices():
+                desc = str(v.GetDescription())
+                low = desc.lower()
+                if any(
+                    k in desc or k in low
+                    for k in (
+                        "Chinese",
+                        "中文",
+                        "Huihui",
+                        "Yaoyao",
+                        "Kangkang",
+                        "zh-CN",
+                        "Chinese (Simplified)",
+                    )
+                ):
+                    out.append((desc, f"系统 · {desc}"))
+            holder["out"] = out
+        except Exception:
+            holder["out"] = []
+
+    t = threading.Thread(target=_worker, daemon=True, name="sapi-list-voices")
+    t.start()
+    t.join(timeout=max(0.5, float(timeout)))
+    return holder["out"] if not t.is_alive() else []
 
 
 def speed_to_rate(speed: float) -> str:
@@ -340,15 +490,16 @@ async def synthesize_edge_to_file(
     on_status=None,
     stop_event: threading.Event | None = None,
 ) -> None:
-    """微软在线神经网络合成（需联网；已打端点补丁；失败自动重试）。"""
-    if not EDGE_TTS_AVAILABLE or edge_tts is None:
-        raise RuntimeError("未安装 edge-tts，无法使用在线音色")
+    """微软在线神经网络合成（主进程内；失败自动重试）。"""
+    ready = await asyncio.to_thread(ensure_edge_tts)
+    if not ready or edge_tts is None:
+        raise RuntimeError("在线语音组件未就绪")
     rate = speed_to_rate(tts_speed)
-    tmp = out_path.with_suffix(out_path.suffix + ".partial")
     last_err: BaseException | None = None
     for attempt in range(1, TTS_EDGE_MAX_RETRIES + 1):
         if stop_event is not None and stop_event.is_set():
             raise RuntimeError("stopped")
+        tmp = out_path.with_suffix(out_path.suffix + ".partial")
         try:
             try:
                 tmp.unlink(missing_ok=True)
@@ -359,8 +510,8 @@ async def synthesize_edge_to_file(
                 voice=voice_id,
                 rate=rate,
                 pitch=pitch or "+0Hz",
-                connect_timeout=45,
-                receive_timeout=180,
+                connect_timeout=25,
+                receive_timeout=90,
             )
             await communicate.save(str(tmp))
             if not tmp.exists() or tmp.stat().st_size <= 0:
@@ -377,7 +528,7 @@ async def synthesize_edge_to_file(
                 raise RuntimeError("stopped") from exc
             if attempt >= TTS_EDGE_MAX_RETRIES:
                 break
-            delay = min(12.0, 0.7 * (2 ** (attempt - 1)))
+            delay = min(5.0, 0.4 * (2 ** (attempt - 1)))
             if on_status:
                 try:
                     on_status(f"在线语音重试 {attempt}/{TTS_EDGE_MAX_RETRIES}…")
@@ -474,6 +625,14 @@ def ensure_app_dir() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     IMPORT_EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
+    # 旧版 Piper 语音目录已废弃，启动时清掉
+    legacy_voices = APP_DIR / "voices"
+    if legacy_voices.exists():
+        try:
+            shutil.rmtree(legacy_voices, ignore_errors=True)
+        except Exception:
+            pass
+    cleanup_tts_cache()
 
 
 def load_json(path: Path, default):
@@ -1199,15 +1358,14 @@ def split_sentences(text: str) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
-# 朗读块：偏短更抗弱网（单次请求不易超时），仍保留一定上下文消歧多音字
-SPEECH_CHUNK_CHARS = 200
-TTS_PARALLEL_EDGE = 2  # 在线微软：并行预加载（与旧版一致）
+# 朗读块略加大，减少联网次数；首段就绪即播，边听边预载
+SPEECH_CHUNK_CHARS = 280
+TTS_PARALLEL_EDGE = 2  # 在线微软：并行预加载
 TTS_PARALLEL_LOCAL = 1  # 本地 SAPI：串行更稳
-TTS_PREFETCH_EDGE = 8  # 在线预取深度
-TTS_PREFETCH_LOCAL = 4
-TTS_START_BUFFER = 2  # 开播前至少就绪段数
-TTS_EDGE_MAX_RETRIES = 8  # 在线段内重试次数（有网不轻易降级）
-# 兼容旧常量引用
+TTS_PREFETCH_EDGE = 4  # 在线预取深度（够用即可，避免囤太多占盘）
+TTS_PREFETCH_LOCAL = 2
+TTS_START_BUFFER = 1  # 首段就绪即可开播
+TTS_EDGE_MAX_RETRIES = 5
 TTS_PARALLEL = TTS_PARALLEL_EDGE
 TTS_PREFETCH = TTS_PREFETCH_EDGE
 
@@ -2228,11 +2386,11 @@ class NeuralPlayer:
     def list_voices(self) -> list[tuple[str, str]]:
         items: list[tuple[str, str]] = []
         for p in VOICE_PROFILES:
-            # 未安装 edge-tts 时隐藏在线音色
-            if p[2] == "edge" and not EDGE_TTS_AVAILABLE:
+            # 在线音色始终展示；真正导入失败后仍可选手动重试
+            if p[2] == "edge" and _EDGE_TTS_FAILED:
                 continue
             items.append((p[0], p[1]))
-        for desc, label in list_sapi_chinese_voices():
+        for desc, label in list_sapi_chinese_voices(timeout=2.5):
             key = "sapi_" + hashlib.md5(desc.encode("utf-8")).hexdigest()[:10]
             if not any(k == key for k, _ in items):
                 items.append((key, label))
@@ -2275,14 +2433,6 @@ class NeuralPlayer:
         tts_speed, _ = split_speed(self._speed)
         key = hashlib.md5(
             f"v6|{self._backend}|{self._voice_ref}|{self._pitch}|{tts_speed:.3f}|{play_factor:.3f}|{text}".encode(
-                "utf-8"
-            )
-        ).hexdigest()
-        return CACHE_DIR / f"{key}.wav"
-
-    def _raw_tts_cache_path(self, text: str, tts_speed: float) -> Path:
-        key = hashlib.md5(
-            f"v6raw|{self._backend}|{self._voice_ref}|{self._pitch}|{tts_speed:.3f}|{text}".encode(
                 "utf-8"
             )
         ).hexdigest()
@@ -2408,19 +2558,31 @@ class NeuralPlayer:
         tts_speed, play_factor = split_speed(self._speed)
         cached = self._cache_path(speak, play_factor)
         if cached.exists() and cached.stat().st_size > 0:
+            try:
+                # 命中缓存时刷新 mtime，供 LRU 正确淘汰
+                os.utime(cached, None)
+            except Exception:
+                pass
             return cached
 
         if play_factor <= 1.01:
             await self._synthesize(speak, cached, tts_speed)
+            note_tts_cache_write()
             return cached
 
-        # 超高倍速：先按 TTS 上限合成，再本地加速
-        raw = self._raw_tts_cache_path(speak, tts_speed)
-        if not (raw.exists() and raw.stat().st_size > 0):
+        # 超高倍速：临时合成再本地加速，不长期保留 raw 副本
+        raw = CACHE_DIR / f"{cached.stem}.raw.wav"
+        try:
             await self._synthesize(speak, raw, tts_speed)
-        await asyncio.to_thread(apply_playback_speed, raw, cached, play_factor)
+            await asyncio.to_thread(apply_playback_speed, raw, cached, play_factor)
+        finally:
+            try:
+                raw.unlink(missing_ok=True)
+            except Exception:
+                pass
         if not cached.exists() or cached.stat().st_size <= 0:
             raise RuntimeError("本地倍速处理失败")
+        note_tts_cache_write()
         return cached
 
     def _producer_loop(self, chunks: list[tuple[int, int, str]], audio_q: queue.Queue) -> None:
@@ -2847,6 +3009,8 @@ class App(ctk.CTk):
         self.after(200, self._try_restore_last)
         self.after(300, self._start_hotkeys)
         self.after(50, self._drain_play_ui)
+        # 后台预热在线语音库（主进程内，只加载一次）
+        warmup_edge_tts_async()
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(1, weight=1)
@@ -5223,8 +5387,24 @@ class App(ctk.CTk):
 
 def main() -> None:
     _configure_app_encoding()
-    app = App()
-    app.mainloop()
+    try:
+        app = App()
+        app.mainloop()
+    except Exception as exc:
+        try:
+            ensure_app_dir()
+            crash = APP_DIR / "crash.log"
+            crash.write_text(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n{type(exc).__name__}: {exc}\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        try:
+            messagebox.showerror(APP_NAME, f"程序启动失败：\n{exc}")
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
